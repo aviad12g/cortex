@@ -1,0 +1,21 @@
+{
+  "run_id": "a1_kv_Qwen1.5-1_cortex_20251008_153204",
+  "variant": "cortex",
+  "task": "kv",
+  "gaps": [
+    1024,
+    2048
+  ],
+  "seed": 42,
+  "epochs": 1,
+  "batch_size": 4,
+  "alpha_max": 0.05,
+  "fast_rank": 16,
+  "fast_decay": 0.95,
+  "fast_beta": 0.01,
+  "lr_sidecar": 0.0002,
+  "grad_clip": 1.0,
+  "amp": true,
+  "use_session": true,
+  "git_hash": "b2138019b33adc1f1c3004a7512fd942a1704ff2"
+}

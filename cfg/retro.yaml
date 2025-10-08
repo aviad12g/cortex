@@ -1,0 +1,9 @@
+base_model: mistralai/Mistral-7B-Instruct
+rank_fast: 16
+decay: 0.95
+alpha_max: 0.05
+beta: 0.01
+code_size: 128
+sleep_interval: 512
+sleep_steps: 8
+fisher_lambda: 0.1
