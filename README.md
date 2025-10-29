@@ -1,6 +1,6 @@
 # Cortex
 
-Fast-weight memory for LLMs. Biological memory systems inspired this - think hippocampus meets transformer.
+Fast weight memory for LLMs. Biological memory systems inspired this  think hippocampus meets transformer.
 
 ## What is this?
 
