@@ -1,17 +1,11 @@
-"""
-Synaptic scaling utilities to maintain activation norms near a target value.
-"""
-
-from __future__ import annotations
+"""Synaptic scaling to keep norms stable."""
 
 import torch
 import torch.nn as nn
 
 
 def apply_synaptic_scaling(module: nn.Module, target: float = 1.0, rate: float = 1e-4) -> None:
-    """
-    Gently rescale parameters of LayerNorm or linear layers to maintain stability.
-    """
+    # gently push weights toward target norm
     for submodule in module.modules():
         if isinstance(submodule, nn.LayerNorm):
             with torch.no_grad():

@@ -1,8 +1,4 @@
-"""
-Training loop utilities covering live tokens and micro-sleep phases.
-"""
-
-from __future__ import annotations
+"""Hooks for live and sleep training phases."""
 
 from dataclasses import dataclass
 from typing import Callable, Dict

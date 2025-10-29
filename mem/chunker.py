@@ -1,8 +1,4 @@
-"""
-Surprise-driven segmenter that emits boundaries and caches segment statistics.
-"""
-
-from __future__ import annotations
+"""Segment boundary detector using surprise (NLL vs EMA)."""
 
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -19,25 +15,19 @@ class ChunkerConfig:
 
 
 class SurpriseChunker:
-    """Track running surprise and emit boundary flags with hysteresis."""
+    """Emits 'open'/'close' signals when surprise crosses thresholds."""
 
     def __init__(self, cfg: ChunkerConfig):
         self.cfg = cfg
         self.reset()
 
     def reset(self) -> None:
-        self.ema: Optional[torch.Tensor] = None
+        self.ema = None
         self.active = False
         self.step_count = 0
         self.last_boundary_step = -self.cfg.min_steps_between_boundaries
 
     def step(self, nll: torch.Tensor) -> Optional[Literal["open", "close"]]:
-        """
-        Args:
-            nll: scalar tensor with token negative log-likelihood.
-        Returns:
-            "open", "close", or None depending on boundary events.
-        """
         self.step_count += 1
         if self.ema is None:
             self.ema = nll.detach()
@@ -47,6 +37,7 @@ class SurpriseChunker:
         if self.ema is None or self.ema.item() <= 0:
             return None
 
+        # don't fire boundaries too often
         if self.step_count - self.last_boundary_step < self.cfg.min_steps_between_boundaries:
             return None
 
@@ -54,6 +45,7 @@ class SurpriseChunker:
         tau_up = self.cfg.tau_up_multiplier * self.ema.item()
         tau_down = self.cfg.tau_down_multiplier * self.ema.item()
 
+        # hysteresis: different thresholds for open vs close
         if not self.active and surprise > tau_up:
             self.active = True
             self.last_boundary_step = self.step_count

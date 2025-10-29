@@ -1,8 +1,4 @@
-"""
-Approximate diagonal Fisher information estimates for Cortex parameters.
-"""
-
-from __future__ import annotations
+"""Diagonal Fisher approximation for EWC."""
 
 from typing import Dict, Iterable
 
@@ -11,13 +7,14 @@ import torch.nn as nn
 
 
 class FisherDiagonal:
-    """Track running second moments of gradients for EWC-style regularisation."""
+    """Running EMA of squared gradients."""
 
     def __init__(self, decay: float = 0.9):
         self.decay = decay
         self.stats: Dict[str, torch.Tensor] = {}
 
     def update(self, params: Iterable[nn.Parameter]) -> None:
+        # accumulate grad^2 per param
         for param in params:
             if param.grad is None:
                 continue

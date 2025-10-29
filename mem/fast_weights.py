@@ -1,8 +1,4 @@
-"""
-Utility functions for managing Cortex fast-weight buffers.
-"""
-
-from __future__ import annotations
+"""Helpers for managing fast-weight buffers."""
 
 from typing import Dict
 
@@ -15,16 +11,14 @@ def allocate_fast_buffers(
     batch_size: int,
     device: torch.device,
 ) -> None:
-    """
-    Recursively reset fast buffers on all Cortex blocks within `module`.
-    """
+    # recursively find all Cortex blocks and reset their U, V
     for child in module.modules():
         if hasattr(child, "reset_fast"):
             child.reset_fast(batch_size, device=device)
 
 
 class FastWeightTraces:
-    """Container for retaining delta snapshots per layer within a segment."""
+    """Track deltas across a segment for later replay."""
 
     def __init__(self):
         self.traces: Dict[str, torch.Tensor] = {}

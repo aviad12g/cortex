@@ -1,11 +1,8 @@
-"""
-Evaluation recipes for reach, retention, and stability metrics.
-"""
-
-from __future__ import annotations
+"""Eval metrics for reach, retention, stability."""
 
 
 def evaluate_reach(*args, **kwargs):
+    # TODO: implement
     raise NotImplementedError
 
 

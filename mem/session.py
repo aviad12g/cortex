@@ -1,12 +1,8 @@
-"""
-Session management for Cortex fast-weight persistence and controller signals.
-"""
-
-from __future__ import annotations
+"""Per-session state: fast buffers, controller signals, code queue."""
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, Optional
 
 import torch
 
@@ -19,7 +15,7 @@ class FastBufferSnapshot:
 
 @dataclass
 class SessionState:
-    """Holds per-session fast buffers, controller context, and code queues."""
+    """Persistent state across multiple forward passes in a conversation."""
 
     session_id: str
     phase_period: int = 256
@@ -46,10 +42,8 @@ class SessionState:
         return self.fast_buffers.get(layer_idx)
 
     def controller_inputs(self, batch_size: int, seq_len: int, device: torch.device) -> Dict[str, torch.Tensor]:
-        """
-        Produce controller inputs for the upcoming sequence portion.
-        Currently uses stored scalar levels and a simple sinusoidal phase.
-        """
+        # build controller input dict: surprise, uncertainty, reward, phase
+        # phase is just a sin wave for now
         ticks = torch.arange(seq_len, device=device).unsqueeze(0).repeat(batch_size, 1)
         absolute_step = self.step_count + ticks
         phase = torch.sin(2 * torch.pi * absolute_step / max(self.phase_period, 1))

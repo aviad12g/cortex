@@ -1,12 +1,8 @@
-"""
-Code maker that compresses segment statistics into fixed-size vectors.
-"""
-
-from __future__ import annotations
+"""Compress segment statistics into fixed-size latent codes."""
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -26,18 +22,20 @@ class CodeMakerConfig:
 
     @property
     def fast_delta_dim(self) -> int:
+        # flattened U and V deltas
         return 2 * self.n_heads * self.d_head * self.rank_fast
 
 
 class CodeMaker(nn.Module):
-    """Encodes aggregated features into latent codes for replay."""
 
     is_cortex_param = True
 
     def __init__(self, cfg: CodeMakerConfig):
         super().__init__()
         self.cfg = cfg
+        # project fast deltas down to d_model
         self.delta_proj = nn.Linear(cfg.fast_delta_dim, cfg.d_model)
+        # aggregate across layers
         self.layer_proj = nn.Linear(cfg.n_layers * 3 * cfg.d_model, cfg.d_model)
         self.encoder = nn.Sequential(
             nn.Linear(cfg.d_model, 2 * cfg.d_model),
@@ -56,12 +54,8 @@ class CodeMaker(nn.Module):
         h_second: torch.Tensor,
         delta_fast: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            h_mean: [B, L, D] mean hidden state per layer.
-            h_second: [B, L, D] second moment per layer.
-            delta_fast: [B, L, fast_delta_dim] flattened fast delta.
-        """
+        # h_mean, h_second: [B, L, D]
+        # delta_fast: [B, L, fast_delta_dim]
         B = h_mean.size(0)
         delta_proj = self.delta_proj(delta_fast.view(B * self.cfg.n_layers, -1))
         delta_proj = delta_proj.view(B, self.cfg.n_layers, self.cfg.d_model)
@@ -72,7 +66,6 @@ class CodeMaker(nn.Module):
         return self.encoder(summary)
 
     def reconstruct(self, code: torch.Tensor) -> torch.Tensor:
-        """Reconstruct the layer summary vector for replay supervision."""
         return self.decoder(code)
 
 
@@ -101,14 +94,7 @@ class CodeQueue:
 
 
 class SegmentAccumulator:
-    """
-    Accumulates statistics for a segment across layers to feed the CodeMaker.
-
-    Usage:
-        acc.start(fast_buffers)
-        acc.accumulate(per_layer_hidden_states)
-        code_inputs = acc.finalize(fast_buffers_end)
-    """
+    """Collect mean/variance of hiddens + fast-weight deltas across a segment."""
 
     def __init__(self, cfg: CodeMakerConfig):
         self.cfg = cfg
@@ -116,8 +102,8 @@ class SegmentAccumulator:
 
     def reset(self) -> None:
         self._count = 0
-        self._h_sum: Optional[torch.Tensor] = None
-        self._h_sq_sum: Optional[torch.Tensor] = None
+        self._h_sum = None
+        self._h_sq_sum = None
         self._fast_start: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def start(self, fast_buffers: Dict[int, Tuple[torch.Tensor, torch.Tensor]]) -> None:

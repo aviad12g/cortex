@@ -1,8 +1,4 @@
-"""
-Neuromodulator controller that drives fast write gates and sleep scheduling.
-"""
-
-from __future__ import annotations
+"""Neuromodulator - controls when/how much to write to fast weights."""
 
 from dataclasses import dataclass
 from typing import Dict
@@ -18,13 +14,13 @@ class ControllerConfig:
 
 
 class CortexController(nn.Module):
-    """Compute neuromodulator signals from surprise, uncertainty, and rhythm inputs."""
 
     is_cortex_param = True
 
     def __init__(self, cfg: ControllerConfig):
         super().__init__()
         self.cfg = cfg
+        # simple 2-layer MLP: 4 inputs -> 2 outputs
         self.net = nn.Sequential(
             nn.Linear(4, cfg.hidden),
             nn.Tanh(),
@@ -33,12 +29,7 @@ class CortexController(nn.Module):
         )
 
     def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            inputs: dict with keys surprise, uncertainty, reward, phase each [B, 1].
-        Returns:
-            dict with keys m_gate (global plasticity) and write_scale.
-        """
+        # inputs: surprise, uncertainty, reward, phase
         stacked = torch.cat(
             [inputs[k] for k in ("surprise", "uncertainty", "reward", "phase")], dim=-1
         )

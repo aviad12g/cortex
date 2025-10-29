@@ -1,23 +1,19 @@
+"""Synthetic long-context tasks for testing memory reach.
+
+Four task families:
+- KV binding
+- Copy-reverse
+- N-back
+- Long addition
+
+All deterministic given seed + gap.
 """
-Synthetic long-context curricula for Stage A1 memory evaluations.
-
-This module constructs four task families:
-    1. Key-value binding with distractors.
-    2. Copy-and-reverse with intervening noise.
-    3. N-back probes on symbol streams.
-    4. Long addition with carry propagation.
-
-Each task exposes deterministic generation given a RNG seed and gap length G,
-ensuring reproducibility across training and evaluation.
-"""
-
-from __future__ import annotations
 
 import dataclasses
 import json
 import random
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional
 
 VOCAB_SYMBOLS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 VOCAB_DIGITS = list("0123456789")
@@ -53,8 +49,6 @@ class TaskSample:
 
 
 class BaseGenerator:
-    """Base generator providing helper utilities."""
-
     def __init__(self, seed: int):
         self.seed = seed
         self.rng = random.Random(seed)

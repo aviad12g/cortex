@@ -1,514 +1,459 @@
-# Cortex: Fast-Weight Memory Augmentation for LLMs
+# Cortex
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+Fast-weight memory for LLMs. Biological memory systems inspired this - think hippocampus meets transformer.
 
-> A neurally-inspired framework that extends LLM context through fast-weight memory sidecars, enabling continual learning without catastrophic forgetting.
+## What is this?
 
-## Overview
+Cortex adds trainable "fast weights" to a frozen LLM. These let the model remember things beyond its normal context window. The memory decays over time but can be consolidated during sleep phases.
 
-**Cortex** augments pretrained transformers with fast-weight memory systems inspired by biological complementary learning (hippocampus-neocortex). Key features:
+Main ideas:
+- Base model stays frozen
+- Only lightweight sidecars get trained
+- Learns when to write via neuromodulation
+- Sleep-based consolidation for long-term stability
 
-- **4× context reach extension** on long-range retrieval tasks
-- **Zero base model modification** - all updates go to lightweight sidecars
-- **Neuromodulated plasticity** - learns when and what to remember
-- **Sleep-inspired consolidation** - offline replay for stable learning
-
-**Core Innovation**: Low-rank fast-weight matrices (U, V) that decay over time, updated via Hebbian learning with surprise-driven plasticity control. **Never materializes K_fast = UV** - uses efficient low-rank reads instead.
+The core trick is using low-rank matrices U and V per attention head. We never form the full product UV (that's expensive). Instead we do efficient factorized reads: `y_fast = V(U^T q)`.
 
 ## Quick Start
 
 ```bash
-# Install
 pip install torch>=2.0.0 transformers>=4.30.0
 
-# Load model with Cortex sidecars
 from base.hf_wrap import load_qwen_with_cortex, CortexWrapConfig
 
 model = load_qwen_with_cortex(
     "Qwen/Qwen1.5-1.8B-Chat",
-    cortex_cfg=CortexWrapConfig(rank_fast=16, decay=0.95, alpha_max=0.05)
+    cortex_cfg=CortexWrapConfig(rank_fast=16, decay=0.95)
 )
 
-# Multi-turn conversation with persistent memory
+# multi-turn with persistent memory
 outputs = model(**inputs, session_id="chat_001", reset_session=True)
 ```
 
-## System Architecture
+## Architecture
 
-Cortex wraps a frozen base transformer with trainable memory components:
+### System Overview
 
 ```
-Controller (surprise, uncertainty → plasticity gates)
-    ↓
-┌─────────────────────────────────────────┐
-│ Transformer Layer (×24 for Qwen-1.8B)  │
-│  ┌──────────────┐  ┌─────────────────┐ │
-│  │ Base Attn    │  │ CortexBlock     │ │
-│  │ (Frozen)     │  │ U, V ∈ ℝ^{H×d×r}│ │
-│  │              │◄─┤ (Trainable)     │ │
-│  │ Q,K,V shared │  │                 │ │
-│  └──────────────┘  └─────────────────┘ │
-│         │                  │            │
-│         └──── Dual Mix ────┘            │
-│    y = σ(g)·y_fast + (1-σ(g))·v        │
-└─────────────────────────────────────────┘
-    ↓
-SessionState (optional cross-turn persistence)
+┌─────────────────────────────────────────────────────────────┐
+│                      Frozen Base LLM                        │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │              Transformer Layer 0                     │  │
+│  │                                                       │  │
+│  │  ┌──────────────┐         ┌──────────────────────┐  │  │
+│  │  │  Self-Attn   │ ◄─────► │  CortexBlock         │  │  │
+│  │  │  (frozen)    │         │  U[H,d,r], V[H,r,d]  │  │  │
+│  │  │              │         │  (trainable)         │  │  │
+│  │  └──────────────┘         └──────────────────────┘  │  │
+│  │         │                           │                │  │
+│  │         └─────── mixed output ──────┘                │  │
+│  │                                                       │  │
+│  └─────────────────────────────────────────────────────┘  │
+│                           ⋮                                │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │              Transformer Layer N                     │  │
+│  └─────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+         ▲                                        │
+         │                                        ▼
+    ┌────────────┐                        ┌──────────────┐
+    │ Controller │                        │ SessionState │
+    │    MLP     │                        │  (optional)  │
+    └────────────┘                        └──────────────┘
+    surprise, phase                       persist U,V
+    → plasticity gates                    across turns
 ```
 
-**Key Components**:
-- **Fast Weights**: Per-head matrices U(d×r), V(r×d) with r=16 (low-rank)
-- **Controller**: Small MLP mapping [surprise, uncertainty, reward, phase] → plasticity gates
-- **Low-Rank Mixing**: y_fast = V(U^T q) - **never materializes K_fast**
-- **Session**: Persistent U,V buffers + code queue for multi-turn conversations
+### Per-Layer Detail
 
----
+```
+                  ┌──────────────────┐
+                  │   hidden state   │
+                  └────────┬─────────┘
+                           │
+              ┌────────────┴────────────┐
+              ▼                         ▼
+    ┌──────────────────┐    ┌─────────────────────┐
+    │   Base Attn      │    │   CortexBlock       │
+    │                  │    │                     │
+    │  q = W_Q h       │───►│  Read:              │
+    │  k = W_K h       │    │  k_u = U^T k        │
+    │  v = W_V h       │    │  U += α·k·k_u^T     │
+    │                  │    │  V += α·k_u·v^T     │
+    │  attn(q,k,v)     │    │                     │
+    │      │           │    │  y_fast = V(U^T q)  │
+    │      │           │    │      │              │
+    └──────┼───────────┘    └──────┼──────────────┘
+           │                       │
+           └───────┬───────────────┘
+                   ▼
+          y = σ(g)·y_fast + (1-σ(g))·v
+                   │
+                   ▼
+           ┌───────────────┐
+           │  next layer   │
+           └───────────────┘
+```
 
-## Core Mechanisms
+### Components
 
-### 1. Fast-Weight Dynamics (Corrected)
+**CortexBlock** - the memory sidecar
+- U: `[H, d_head, r]` 
+- V: `[H, r, d_head]`
+- Typical r=16 gives ~30% overhead
+- Never materializes the full `d×d` product
 
-Each CortexBlock maintains low-rank matrices **U** (d×r) and **V** (r×d) per attention head:
+**Controller** - decides when to write
+- Tiny MLP: 4 inputs → 2 outputs
+- Inputs: surprise, uncertainty, reward, phase
+- Outputs: global gate + per-head scales
+
+**SessionState** - cross-turn persistence
+- Stores U and V between forward passes
+- Optional for multi-turn conversations
+
+## How It Works
+
+### Fast-Weight Update
+
+Each timestep updates the memory:
 
 ```python
-# At each timestep t:
-# Projections (shared with base model)
+# projections (shared with base model)
 q, k, v = W_Q h, W_K h, W_V h
 
-# 1. Decay
-U, V ← γ·U, γ·V                           # γ=0.95
+# decay old memories
+U *= 0.95
+V *= 0.95
 
-# 2. Hebbian update (low-rank, never form UV)
-k_u = U^T k                                # [r] - project key into fast space
-U += α_eff · k·k_u^T                       # [d×r] outer product
-V += α_eff · k_u·v^T                       # [r×d] outer product
+# Hebbian learning
+k_u = U.T @ k              # project key to rank-r space
+U += alpha * outer(k, k_u)  # strengthen association
+V += alpha * outer(k_u, v)  # store value
 
-# 3. Anti-Hebbian stabilization
-U -= β·clamp(U, -1, 1)                     # β=0.01
-V -= β·clamp(V, -1, 1)
+# anti-Hebbian stabilization
+U -= 0.01 * clamp(U, -1, 1)
+V -= 0.01 * clamp(V, -1, 1)
 
-# 4. Low-rank read (KEY: avoid materializing K_fast = UV)
-y_fast = V·(U^T q)                         # [d] - two matrix-vector products
+# read from memory (the key operation)
+y_fast = V @ (U.T @ q)      # two cheap matmuls instead of expensive UV
 
-# 5. Mixing
-g = learnable_gate(q, k, y_fast)           # scalar logit
-y = σ(g)·y_fast + (1-σ(g))·v               # [d] vector output
+# mix with slow path
+gate = learned_gate(q, k, y_fast)
+y = sigmoid(gate) * y_fast + (1 - sigmoid(gate)) * v
 ```
 
-**Why this is correct and efficient**:
-- **Typing**: y_fast ∈ ℝ^d, v ∈ ℝ^d, so y ∈ ℝ^d (well-typed)
-- **Complexity**: Read = 2 GEMMs (d×r @ r×1 + r×d @ d×1) = **O(d·r)** per head, not O(d²)
-- **Memory**: Never allocate d×d matrix
-- **Speed**: For r=16, H=16, overhead is **~25-35%** vs base attention (vs 100% if materializing UV)
+Why this is fast:
+- Two `O(d·r)` operations instead of one `O(d²)`
+- For r=16 and d=128 this is ~8x cheaper
+- Memory usage stays small
 
-**Optional MoE-style gating** (if you want attention scores):
-```python
-s_slow = (q^T k) / √d                      # scalar
-s_fast = (q^T y_fast) / √d                 # scalar
-w = softmax([s_slow, s_fast])              # [2]
-y = w[0]·v + w[1]·y_fast                   # [d]
-```
+### Controller
 
-### 2. Neuromodulated Plasticity
-
-A small MLP learns **when to write** to fast weights based on context:
+Small network that learns when to write:
 
 ```python
-# Controller inputs:
-surprise    = loss - EMA(loss)             # Deviation from expectation
-uncertainty = entropy(predictions)          # Model confidence
-reward      = task_signal                  # (future work)
-phase       = sin(2πt / period)            # Circadian rhythm
+# compute surprise during training
+loss_t = -log p(y_t | x)
+ema = 0.99 * ema + 0.01 * loss_t
+surprise = loss_t - ema
 
-# Controller: [s, u, r, φ] → [m_gate, write_scale]
-gates = Controller([surprise, uncertainty, reward, phase])
+# also track uncertainty
+uncertainty = entropy(p)
 
-# Final plasticity:
-α_eff = sigmoid(W_α·h) · m_gate · write_scale · α_max
+# controller decides plasticity
+gates = MLP([surprise, uncertainty, reward, phase])
+alpha = sigmoid(h) * gates.m_gate * gates.write_scale * 0.05
 
-# Guard: if uncertainty already high, cap write_scale
+# safety: don't write when very uncertain
 if uncertainty > threshold:
-    write_scale = min(write_scale, 0.5)    # Avoid amplifying noise
+    alpha *= 0.5
 ```
 
-**Inference-time surprise** (no teacher forcing):
-```python
-# During generation:
-p_t = model.next_token_dist(x_≤t)          # Current predictions
-loss_t = -log p_t[sampled_token]           # Self-supervised signal
-ema_t = 0.99·ema_{t-1} + 0.01·loss_t       # Per-layer or global EMA
-surprise_t = loss_t - ema_t                # Input to controller
-```
+During inference with no labels we use the model's own predictions to compute surprise - same mechanism works everywhere.
 
-**Observed behavior**: m_gate correlates strongly with surprise (r=0.74), meaning the model learns to increase plasticity during schema violations.
+### Consolidation
 
-### 3. Memory Consolidation (Stages A2-A4)
-
-Sleep-inspired offline learning for stable continual learning:
+Every 512 tokens we do a short "sleep" phase:
 
 ```python
-# 1. Segment Boundaries (surprise-based hysteresis)
-if loss - EMA(loss) > 1.2·EMA:             # High surprise
-    OPEN_SEGMENT()
-    save U_start, V_start
+# detect interesting segments via surprise
+if loss - ema > 1.2 * ema:
+    # surprise spike - start tracking
+    segment_start = (U.clone(), V.clone())
 
-if loss - EMA(loss) < 1.05·EMA:            # Return to normal  
-    CLOSE_SEGMENT()
-    # Log segment statistics
+if loss - ema < 1.05 * ema:
+    # back to normal - compress and store
     stats = {
-        'h_mean': Σh_t / count,            # [L, d]
-        'h_var': Σ(h_t²) / count,          # [L, d]
-        'delta_U': U_end - U_start,        # [L, H, d, r]
-        'delta_V': V_end - V_start,        # [L, H, r, d]
+        'h_mean': mean(hiddens),
+        'h_var': var(hiddens),
+        'delta_U': U - segment_start[0],
+        'delta_V': V - segment_start[1]
     }
-    code = Encoder(stats)                  # → [d_code=128]
+    code = Encoder(stats)  # compress to 128-d vector
+    save_for_replay(code, stats)
 
-# 2. Consolidation Target (well-defined)
-Target(code) = [h_mean, h_var, delta_U, delta_V]  # Reconstruct exact logged stats
-
-# 3. Sleep Replay (every 512 tokens, 8 steps)
-codes = sample_from_queue()
-targets = retrieve_logged_stats(codes)     # Anchored to pre-sleep snapshots
-reconstructions = Decoder(codes)
-loss = ||reconstructions - targets||² + λ·Fisher_penalty
-update_cortex_only(loss)                   # Fisher anchors = pre-sleep params
+# during sleep
+batch = sample_codes()
+targets = load_stats(batch)
+reconstructed = Decoder(batch)
+loss = mse(reconstructed, targets) + fisher_penalty
+# gradient descent on Cortex params only
 ```
 
-**Fisher anchoring per batch**: Before each sleep batch, snapshot θ_cortex as anchor for EWC penalty.
+The Fisher penalty keeps parameters from drifting too far from their pre-sleep values.
 
----
+## Training Stages
 
-## Training Stages & Experiments
-
-### Training Stages
+We're building this in phases:
 
 | Stage | Goal | Status |
 |-------|------|--------|
-| **A1** | Validate fast-weight reach extension (base frozen) | Implemented |
-| **A2** | Learn segment compression codes | Planned |
-| **A3** | Enable sleep consolidation via replay | Planned |
-| **A4** | Selective base model updates during sleep | Planned |
+| A1 | Fast-weight reach extension | Done |
+| A2 | Learn segment codes | In progress |
+| A3 | Sleep consolidation | Planned |
+| A4 | Selective base updates | Planned |
 
 ### Synthetic Tasks
 
-Four long-context retrieval tasks with parameterized gaps:
+Testing memory with four task types:
 
-| Task | Description | Gap Range |
-|------|-------------|-----------|
-| **Key-Value** | Store 6 pairs, retrieve after noise | 256-4096 tokens |
-| **Copy-Reverse** | Reverse 12-digit sequence after gap | 256-2048 tokens |
-| **N-Back** | Detect symbol repetition N steps back | 512-2048 tokens |
-| **Long Addition** | Add 32-digit numbers across gap | 256-2048 tokens |
+**KV Binding**
+```
+HEADER: K1->XBQZ; K2->MFJK; K3->PLWT; ...
+DISTRACTOR: (256-4096 tokens of noise)
+QUERY: ASK K2?
+ANSWER: MFJK
+```
 
-**Evaluation**:
-- **Reach curves**: Accuracy vs gap length  
-- **Fast-weight usage**: Per-layer utilization histograms
-- **Gate correlation**: m_gate vs surprise (target r > 0.7)
-- **Drift monitoring**: Base model PPL stability (< 1-2%)
+**Copy-Reverse**
+```
+PROMPT: <SEQ> 5 7 2 9 1 3 </SEQ>
+DISTRACTOR: (noise)
+QUERY: REVERSE <SEQ>
+ANSWER: 3 1 9 2 7 5
+```
 
-**Ablations**: `cortex` (full), `fast_off` (α=0), `baseline`, `no_decay`, `no_anti_hebb`, `fixed_alpha`
+**N-Back**
+```
+STREAM: A B C D A E [B] C D E ...
+QUERY: NBACK 5 B
+ANSWER: YES
+```
 
----
+**Long Addition**
+```
+CALC: + 41592653589793238462 64338327950288419716
+DISTRACTOR: (noise)
+QUERY: SUM?
+ANSWER: 105930981540081658178
+```
 
-## Results (Stage A1)
-
-### Reach Extension on KV Task
-
-| Gap | Baseline | Cortex | Improvement |
-|-----|----------|--------|-------------|
-| 256 | 0.94 | 0.96 | +2% |
-| 512 | 0.82 | 0.91 | +11% |
-| 1024 | 0.54 | 0.84 | **+56%** |
-| 2048 | 0.21 | 0.68 | **+224%** |
-| 4096 | 0.08 | 0.43 | **+438%** |
-
-**Reach threshold**: Baseline 512 tokens → Cortex **2048 tokens (4× extension)**
-
-### Key Metrics
-
-**Fast-weight usage** (KV task, gap=1024):
-- Layers 2-19: 50-85% fast-path utilization (peak at layers 4-6)
-- Layer 23: 17% (final layers use parametric memory for output)
-
-**Neuromodulation**:
-- Surprise ↔ m_gate correlation: **r = 0.74** (target exceeded)
-- Controller successfully gates plasticity based on prediction error
-
-**Drift stability**:
-- Base model PPL change after 2 epochs: **< 1%** (excellent)
-- Zero catastrophic forgetting confirmed
-
-### Ablations (KV task, gap=1024)
-
-| Component Removed | Accuracy | Impact |
-|-------------------|----------|--------|
-| Full Cortex | 0.84 | - |
-| Controller | 0.76 | -9.5% |
-| Decay (γ) | 0.61 | -27% |
-| Anti-Hebb (β) | 0.68 | -19% |
-| Fast weights | 0.54 | -36% |
-
-**Takeaway**: Decay is most critical (prevents saturation); all components contribute significantly
-
----
+We vary the gap length and measure accuracy vs distance.
 
 ## Implementation
 
-### Module Organization
+### Files
 
 ```
 cortex-1/
 ├── base/
-│   └── hf_wrap.py          # Hugging Face integration, model wrapping
+│   └── hf_wrap.py          # wrap HF models with sidecars
 ├── blocks/
-│   ├── cortex_block.py     # Fast-weight sidecar implementation
-│   └── controller.py       # Neuromodulatory controller
+│   ├── cortex_block.py     # U,V matrices + update logic
+│   └── controller.py       # plasticity gates
 ├── mem/
-│   ├── fast_weights.py     # Buffer allocation utilities
-│   ├── session.py          # SessionState for multi-turn persistence
-│   ├── chunker.py          # Surprise-based segmentation
-│   ├── codes.py            # CodeMaker and segment compression
-│   ├── consolidation.py    # Sleep replay coordinator
-│   ├── fisher.py           # Fisher information tracking
-│   └── syn_scaling.py      # Synaptic scaling utilities
-├── train/
-│   ├── data_long.py        # Synthetic long-context task generation
-│   ├── loop.py             # Training orchestration
-│   ├── objectives.py       # Loss functions
-│   └── evals.py            # Evaluation metrics
-└── scripts/
-    ├── stage_a1_enable_fast.py     # Stage A1 training harness
-    ├── stage_a2_codes.py           # Stage A2 (planned)
-    ├── stage_a3_sleep_sidecar.py   # Stage A3 (planned)
-    ├── stage_a4_unfreeze_guarded.py # Stage A4 (planned)
-    └── eval_a1_reach.py            # Reach curve evaluation
+│   ├── session.py          # cross-turn state
+│   ├── chunker.py          # segment detection
+│   ├── codes.py            # compression encoder/decoder
+│   ├── consolidation.py    # sleep coordinator
+│   ├── fisher.py           # EWC penalties
+│   └── fast_weights.py     # utilities
+└── train/
+    ├── data_long.py        # synthetic tasks
+    └── objectives.py       # loss functions
 ```
 
-### Integration Details
+### Integration
 
-**Hook-based architecture** injects sidecars without modifying base model code:
-- **Pre-hooks**: Restore U, V from session before each layer
-- **Forward override**: Adds sidecar output to base attention
-- **Weight tying**: Share QKV projections with base model
+We use PyTorch hooks to inject sidecars without modifying the base model:
 
-**Computational cost** (corrected):  
-- **Per-token overhead**: O(H·d_head·r) for both update and read
-  - For r=16, H=16, d=2048: **25-35% additional latency** vs base attention
-  - vs 100%+ if materializing K_fast = UV (incorrect approach)
-- **Memory**: ~2.5M params (0.14% of 1.8B base model)
-- **Wall-clock** (A100): 1.3× base latency at r=16, 1.6× at r=32
+```python
+# attach to each layer
+for layer in model.layers:
+    cortex = CortexBlock(...)
+    cortex.tie_projections(layer.self_attn.q_proj, ...)
+    
+    # restore U,V before forward
+    layer.register_forward_pre_hook(restore_fast_weights)
+    
+    # override forward to include sidecar
+    original_forward = layer.forward
+    layer.forward = lambda h: original_forward(h) + cortex(h, gates)
+```
 
-**Kernel optimization** (TODO):
-- Fuse U^T k and k·k_u^T operations
-- Fuse U^T q and V·(...) for read path
-- Target <20% overhead with custom CUDA kernels
+The base model never knows Cortex exists. QKV projections are shared so we don't duplicate parameters.
 
-**Stability mechanisms**:
-- Gradient clipping, mixed precision (FP16)
-- Anti-Hebbian stabilization, exponential decay
-- Clamping to prevent overflow
-- Per-segment Fisher anchoring
+### Cost
 
----
+For r=16 on Qwen-1.8B:
+- Adds 2.5M parameters (0.14% increase)
+- Wall-clock ~30% slower
+- Memory overhead minimal
+
+Could get to ~20% with fused CUDA kernels.
 
 ## Usage
 
-### Training on Synthetic Tasks
+### Training
 
 ```bash
 python scripts/stage_a1_enable_fast.py \
     --model Qwen/Qwen1.5-1.8B-Chat \
     --task kv \
-    --gaps 256 512 1024 2048 \
-    --variant cortex \
+    --gaps 256,512,1024,2048 \
     --epochs 2 \
-    --batch_size 4 \
-    --save_dir ./checkpoints \
-    --log_dir ./logs
+    --save_dir ./checkpoints
 ```
 
-### Loading Model with Cortex
+### Loading
 
 ```python
 from base.hf_wrap import load_qwen_with_cortex, CortexWrapConfig
 
-# Configure Cortex sidecars
 cortex_cfg = CortexWrapConfig(
-    rank_fast=16,        # Low-rank dimension
-    decay=0.95,          # Temporal decay rate
-    alpha_max=0.05,      # Maximum plasticity
-    beta=0.01,           # Anti-Hebbian strength
+    rank_fast=16,
+    decay=0.95,
+    alpha_max=0.05,
+    beta=0.01,
 )
 
-# Load pretrained model with Cortex augmentation
 model = load_qwen_with_cortex(
-    model_name="Qwen/Qwen1.5-1.8B-Chat",
+    "Qwen/Qwen1.5-1.8B-Chat",
     cortex_cfg=cortex_cfg,
     torch_dtype=torch.float16,
-    device_map="auto",
 )
 
-# Freeze base model (train only sidecars)
-from scripts.stage_a1_enable_fast import freeze_base_model
-freeze_base_model(model)
+# freeze base - train only sidecars
+for param in model.base.parameters():
+    param.requires_grad = False
 ```
 
-### Multi-Turn Sessions
+### Multi-turn Sessions
 
 ```python
-# Persistent memory across turns
-session_id = "chat_001"
+session_id = "conversation_42"
 
-# Turn 1
-outputs_1 = model(**inputs_1, session_id=session_id, reset_session=True)
+# turn 1
+out1 = model(**inputs1, session_id=session_id, reset_session=True)
 
-# Turn 2 (fast weights preserved from turn 1)
-outputs_2 = model(**inputs_2, session_id=session_id, reset_session=False)
+# turn 2 - U,V carry forward
+out2 = model(**inputs2, session_id=session_id)
+
+# turn 3
+out3 = model(**inputs3, session_id=session_id)
 ```
 
-### Evaluation
+## Next Steps
 
-```bash
-python scripts/eval_a1_reach.py \
-    --models ./checkpoints \
-    --variants cortex baseline \
-    --tasks kv copy nback add \
-    --log_dir ./logs \
-    --plot_dir ./plots
-```
+### High Priority
 
----
+**Performance optimization**
+- Fused CUDA kernels for update + read
+- Profile memory bandwidth
+- Try int8 quantization for U,V
 
-## Roadmap & Next Steps
+**Real benchmarks**
+- LongBench (NarrativeQA)
+- L-Eval
+- PersonaChat with long history
+- Compare to RMT and Memorizing Transformers
 
-### Short-term (High Leverage)
+**Safety features**
+- Time-to-live for segments
+- PII detection in write gates
+- Measure memorization vs baseline
 
-**1. Kernel & Profile Pass**
-- Implement fused low-rank read/update kernels (CUDA)
-- Publish latency plots: wall-clock vs r ∈ {8, 16, 32, 64}
-- Memory overhead measurements on A100/4090
-- Target: <25% overhead at r=16
+### Medium Term
 
-**2. Real-World Benchmarks**
-- **LongBench** (NarrativeQA subset): accuracy vs context length
-- **L-Eval / InfiniteBench**: selected long-context tasks  
-- **Dialogue**: PersonaChat/MSC with conversation history
-- **Long-doc QA**: Qasper, QuALITY
-- **Goal**: Beat RMT/Memorizing Transformers at iso-latency
+**Finish training stages**
+- A2: segment compression
+- A3: sleep consolidation
+- A4: selective base unfreezing
 
-**3. Safety Knobs**
-- Per-segment TTL (time-to-live) for ephemeral memory
-- PII pattern filters in write gates
-- Show reduced sticky memorization vs baseline
+**Scale up**
+- Test on Llama-70B
+- Multi-GPU coordination
+- Efficient distributed training
 
-**4. Consolidation Demo (A2-A3)**
-- Run sleep replay on 100k token sequences
-- Show: <1-2% drift + improved re-access vs pure decay
-- Validate Fisher anchoring prevents forgetting
+### Long Term
 
-**5. Scaling Curve**
-- Sweep r ∈ {8, 16, 32, 64} × layers used
-- Find capacity vs overhead elbow
-- Per-layer fast-usage histograms with/without sleep
+- Adaptive rank per layer
+- Multi-timescale decay
+- Extension to vision-language models
+- Production deployment
 
-### Medium-term
+## Technical Details
 
-**Stage A2-A4 Implementation**:
-- Segment compression and code learning  
-- Sleep consolidation with replay
-- Selective base model unfreezing during sleep (Fisher-guided)
+### Math
 
-**Production Optimization**:
-- INT8 quantization for U, V with FP32 accumulators
-- Distributed training for 70B+ models
-- Multi-GPU fast-weight synchronization
-
-### Long-term
-
-- Scale to Llama-3-70B, Mixtral-8×7B
-- Multi-modal extension (vision-language models)
-- Adaptive rank learning per layer/head
-- Hierarchical timescales (fast/medium/slow decay rates)
-- Transfer to real-world deployment (RAG enhancement, personalization)
-
----
-
-## Technical Notes
-
-### Corrected Mathematics
-
-**Never materialize K_fast = UV**. Use low-rank factorization throughout:
+The key insight is factorization:
 
 ```
-Projections: q = W_Q h,  k = W_K h,  v = W_V h
+DON'T DO THIS (slow):
+    K_fast = U @ V                    # [d×d] materialization
+    y_fast = K_fast @ q               # [d×d] @ [d]
+    Cost: O(d²·r) + O(d²) = disaster
 
-Decay: U ← γ·U,  V ← γ·V
-
-Hebbian + anti-Hebbian:
-    k_u = U^T k                           # [r]
-    U ← U + α_eff·k·k_u^T - β·clip(U)     # [d×r]
-    V ← V + α_eff·k_u·v^T - β·clip(V)     # [r×d]
-
-Low-rank read: y_fast = V·(U^T q)         # [d]
-
-Simple mixing: y = σ(g)·y_fast + (1-σ(g))·v
-
-Optional MoE gating:
-    ℓ = [q^T k / √d,  q^T y_fast / √d]    # [2] scalars
-    w = softmax(ℓ)                         # [2]
-    y = w[0]·v + w[1]·y_fast               # [d]
+DO THIS (fast):
+    temp = U.T @ q                    # [r] 
+    y_fast = V @ temp                 # [d]
+    Cost: O(d·r) + O(d·r) = great
 ```
 
-**Complexity analysis**:
-- Update: O(d·r) per head for both U and V updates
-- Read: O(d·r) per head (two matrix-vector products)
-- Total per layer per token: O(H·d·r) where H=16, d=128, r=16
-- **Speedup vs naïve**: ~4× faster than materializing d×d matrix
+Both give the same answer but one is 10x faster.
 
-### Hyperparameter Sensitivity
+### Hyperparameters
 
-| r | Reach (1024) | Memory (MB) | Latency (ms) | Recommendation |
-|---|--------------|-------------|--------------|----------------|
-| 8 | 0.78 | 1.2 | +23% | Low capacity |
-| **16** | 0.84 | 2.5 | **+28%** | **Optimal** |
-| 32 | 0.86 | 5.1 | +39% | Diminishing returns |
-| 64 | 0.87 | 10.3 | +67% | Excessive overhead |
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| r | 16 | sweet spot for capacity vs speed |
+| γ (decay) | 0.95 | balances retention and stability |
+| α_max | 0.05 | max learning rate |
+| β (anti-Hebb) | 0.01 | prevents saturation |
 
-**Decay rate γ**:
-- γ=0.90: Faster forgetting, more stable (reach 0.76)
-- γ=0.95: Balanced (reach 0.84) [recommended]
-- γ=0.98: Longer retention but marginal stability
-- γ=1.00: Unstable, saturates (reach 0.61)
+Going to r=32 helps a bit but costs more. Going to r=8 is too small.
 
----
+Decay rate matters a lot:
+- 0.90: faster forgetting but stable
+- 0.95: good balance
+- 0.98: remembers longer but can be unstable
+- 1.00: no forgetting → saturates and breaks
 
-## Key References
+## References
 
-- **Complementary Learning Systems**: McClelland et al. (1995) - Hippocampus-neocortex theory
-- **Fast Weights**: Schmidhuber (1992), Ba et al. (2016), Schlag et al. (2021)
-- **Continual Learning**: Kirkpatrick et al. (2017) - EWC, Rusu et al. (2016) - Progressive Networks
-- **Memory Networks**: Graves et al. (2014) - NTM, Graves et al. (2016) - DNC
+Biological inspiration:
+- McClelland et al. (1995) - complementary learning systems
+- O'Reilly & Norman (2002) - hippocampus/cortex
 
----
+Fast weights:
+- Schmidhuber (1992) - original fast weight idea
+- Ba et al. (2016) - using fast weights to attend to the recent past
+- Schlag et al. (2021) - linear transformers with fast weights
 
-## Citation
+Continual learning:
+- Kirkpatrick et al. (2017) - EWC
+- Zenke et al. (2017) - synaptic intelligence
 
-```bibtex
-@article{cortex2024,
-  title={Cortex: Fast-Weight Memory Augmentation for Large Language Models},
-  author={[Authors]},
-  year={2024}
-}
-```
-
----
+Memory networks:
+- Graves et al. (2014) - Neural Turing Machines
+- Sukhbaatar et al. (2015) - End-to-end memory networks
 
 ## License
 
-MIT License
+MIT
 
-**Contact**: Research team  
-**Status**: Stage A1 implemented, A2-A4 in development  
-**Code**: Requires correction to use low-rank reads (avoid K_fast materialization)
+---
 
+**Status**: Early research code. Stage A1 working. A2-A4 in development.

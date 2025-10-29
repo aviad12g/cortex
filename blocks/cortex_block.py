@@ -1,10 +1,4 @@
-"""
-CortexBlock: attention sidecar with low-rank fast weights and dual-path mixing.
-
-This module will be attached to each attention layer of the base model.
-"""
-
-from __future__ import annotations
+"""Fast-weight sidecar that sits alongside base attention."""
 
 from dataclasses import dataclass
 from typing import Optional
@@ -21,26 +15,21 @@ class CortexBlockConfig:
     decay: float = 0.95
     alpha_max: float = 0.05
     beta: float = 0.01
-    eps: float = 1e-5
+    eps: float = 1e-5  # unused for now
 
 
 class CortexBlock(nn.Module):
-    """
-    Fast-weight sidecar that augments a standard self-attention block.
-
-    The block stores low-rank fast weights (U, V) per head and exposes a forward
-    method that iterates over sequence positions, updating the fast buffers online.
-    """
+    """Low-rank fast weights (U, V) that get updated online per token."""
 
     is_cortex_param = True
 
     def __init__(self, cfg: CortexBlockConfig):
         super().__init__()
         self.cfg = cfg
-        assert cfg.d_model % cfg.n_heads == 0, "d_model must be divisible by n_heads"
+        assert cfg.d_model % cfg.n_heads == 0
         self.d_head = cfg.d_model // cfg.n_heads
 
-        # Fast weight buffers initialised lazily per batch via reset_fast.
+        # U, V buffers - not persistent, reset each batch
         self.register_buffer(
             "U",
             torch.zeros(1, cfg.n_heads, self.d_head, cfg.rank_fast),
@@ -49,39 +38,36 @@ class CortexBlock(nn.Module):
         self.register_buffer(
             "V",
             torch.zeros(1, cfg.n_heads, cfg.rank_fast, self.d_head),
-            persistent=False,
+            persistent=False
         )
 
-        # Plasticity controller projections.
         self.alpha_proj = nn.Linear(cfg.d_model, cfg.n_heads)
         self.mix_logit = nn.Parameter(torch.zeros(cfg.n_heads))
 
-        # Projections default to standalone copies; set via tie_projections.
+        # QKV projections - will be tied to base model later
         self.q_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.k_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.v_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.o_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
 
-        self.last_fast_share: Optional[torch.Tensor] = None
-        self.last_alpha: Optional[torch.Tensor] = None
+        # tracking for analysis
+        self.last_fast_share = None
+        self.last_alpha = None
 
     def reset_fast(self, batch_size: int, device: Optional[torch.device] = None) -> None:
-        """Reset fast weights for a new sequence batch."""
         device = device or self.U.device
         self.U.resize_(batch_size, self.cfg.n_heads, self.d_head, self.cfg.rank_fast).zero_()
         self.V.resize_(batch_size, self.cfg.n_heads, self.cfg.rank_fast, self.d_head).zero_()
 
     def load_fast(self, U: torch.Tensor, V: torch.Tensor) -> None:
-        """Load fast weights from a stored buffer."""
         self.U.resize_as_(U).copy_(U)
         self.V.resize_as_(V).copy_(V)
 
     def _clamp_update(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Anti-Hebbian stabilisation term."""
         return torch.clamp(tensor, min=-1.0, max=1.0)
 
     def tie_projections(self, q_proj: nn.Linear, k_proj: nn.Linear, v_proj: nn.Linear, o_proj: nn.Linear) -> None:
-        """Copy weights from a base attention block into the Cortex projections."""
+        # share QKV weights with base model, freeze them
         with torch.no_grad():
             self.q_proj.weight.copy_(q_proj.weight)
             self.k_proj.weight.copy_(k_proj.weight)
@@ -97,26 +83,19 @@ class CortexBlock(nn.Module):
         alpha_scale: torch.Tensor,
         mix_mode: str = "dual",
     ) -> torch.Tensor:
-        """
-        Process a sequence of hidden states using Cortex fast weights.
-
-        Args:
-            hidden_states: [B, T, D] residual stream entering the block.
-            m_gate: [B, T] plasticity control values in [0, 1].
-            alpha_scale: [B, T, H] per-head plasticity scale in [0, 1].
-            mix_mode: mode controlling slow/fast blending.
-        Returns:
-            Updated hidden states with sidecar contribution applied.
-        """
+        # hidden_states: [B, T, D]
+        # m_gate: [B, T] plasticity
+        # alpha_scale: [B, T, H] per-head scale
         B, T, _ = hidden_states.shape
         if self.U.shape[0] != B:
             self.reset_fast(B, device=hidden_states.device)
 
         deltas = []
-        fast_share_accum: list[torch.Tensor] = []
-        alpha_accum: list[torch.Tensor] = []
+        fast_share_accum = []
+        alpha_accum = []
         self.last_fast_share = None
         self.last_alpha = None
+        
         for t in range(T):
             h_t = hidden_states[:, t, :]
             q = self.q_proj(h_t).view(B, self.cfg.n_heads, self.d_head)
@@ -124,15 +103,18 @@ class CortexBlock(nn.Module):
             v = self.v_proj(h_t).view(B, self.cfg.n_heads, self.d_head)
 
             with torch.no_grad():
-                alpha = torch.sigmoid(self.alpha_proj(h_t))  # [B, H]
+                # compute effective plasticity
+                alpha = torch.sigmoid(self.alpha_proj(h_t))
                 alpha = alpha * m_gate[:, t].unsqueeze(-1)
                 alpha = alpha * alpha_scale[:, t, :]
                 if self.cfg.alpha_max is not None:
                     alpha = torch.clamp(alpha, max=self.cfg.alpha_max)
 
+                # decay
                 self.U.mul_(self.cfg.decay)
                 self.V.mul_(self.cfg.decay)
 
+                # Hebbian update: project k through U, then outer product back
                 ku = torch.einsum("bhd,bhdr->bhr", k, self.U)
                 self.U.add_(
                     alpha.unsqueeze(-1).unsqueeze(-1) * torch.einsum("bhd,bhr->bhdr", k, ku)
@@ -140,6 +122,7 @@ class CortexBlock(nn.Module):
                 self.V.add_(
                     alpha.unsqueeze(-1).unsqueeze(-1) * torch.einsum("bhr,bhd->bhrd", ku, v)
                 )
+                # anti-Hebbian to prevent saturation
                 self.U.add_(-self.cfg.beta * self._clamp_update(self.U))
                 self.V.add_(-self.cfg.beta * self._clamp_update(self.V))
 

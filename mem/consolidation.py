@@ -1,11 +1,6 @@
-"""
-Micro-sleep consolidation loop operating on Cortex sidecar parameters.
-"""
-
-from __future__ import annotations
+"""Sleep/consolidation coordinator with replay + EWC."""
 
 from dataclasses import dataclass
-from typing import Iterable
 
 import torch
 import torch.nn as nn
@@ -21,7 +16,7 @@ class ConsolidationConfig:
 
 
 class Consolidator:
-    """Coordinates replay, EWC-like penalties, and Hebbian capture."""
+    """Replay codes, apply Fisher penalty, normalize weights."""
 
     def __init__(self, cfg: ConsolidationConfig, model: nn.Module):
         self.cfg = cfg
@@ -32,5 +27,6 @@ class Consolidator:
         loss.backward()
 
     def post_update(self) -> None:
+        # synaptic scaling to keep activations stable
         syn_scaling.apply_synaptic_scaling(self.model, target=1.0, rate=self.cfg.scaling_rate)
 

@@ -1,10 +1,4 @@
-"""
-Utilities to wrap Hugging Face decoder-only models with Cortex sidecars.
-
-Stage A1 targets Qwen 1.5B; subsequent stages will generalize to larger bases.
-"""
-
-from __future__ import annotations
+"""Wrap HF models with Cortex sidecars. Currently supports Qwen2."""
 
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
@@ -20,14 +14,12 @@ from mem.session import SessionState
 
 try:
     from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
-except Exception:  # pragma: no cover - optional dependency
-    Qwen2DecoderLayer = None  # type: ignore
+except Exception:
+    Qwen2DecoderLayer = None
 
 
 @dataclass
 class CortexWrapConfig:
-    """Configuration describing how to retrofit a base model with Cortex blocks."""
-
     rank_fast: int = 16
     decay: float = 0.95
     alpha_max: float = 0.05
@@ -38,11 +30,7 @@ class CortexWrapConfig:
 
 
 class CortexWrappedModel(nn.Module):
-    """
-    Thin wrapper that injects Cortex sidecars into a pretrained base transformer.
-
-    The actual sidecar logic lives in blocks.cortex_block and related modules.
-    """
+    """Wraps a base LLM + injects Cortex sidecars via hooks."""
 
     def __init__(self, base: nn.Module, config: CortexWrapConfig):
         super().__init__()
@@ -52,14 +40,14 @@ class CortexWrappedModel(nn.Module):
         self._cortex_layers: Sequence[nn.Module] = ()
         self.sessions: Dict[str, SessionState] = {}
         self._active_session: Optional[SessionState] = None
-        self._gate_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        self._controller_inputs_cache: Optional[Dict[str, torch.Tensor]] = None
-        self._last_gates: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        self.gate_logs: list[Dict[str, float]] = []
+        self._gate_cache = None
+        self._controller_inputs_cache = None
+        self._last_gates = None
+        self.gate_logs = []
         self._default_dtype = next(self.base.parameters()).dtype
-        self._mix_mode: str = "dual"
-        self._alpha_override: Optional[float] = None
-        self._sidecar_enabled: bool = True
+        self._mix_mode = "dual"
+        self._alpha_override = None
+        self._sidecar_enabled = True
 
     def forward(self, *args, **kwargs):
         session_id = kwargs.pop("session_id", None)
@@ -94,11 +82,10 @@ class CortexWrappedModel(nn.Module):
         return outputs
 
     def reset_cortex_state(self, batch_size: int, device: Optional[torch.device] = None) -> None:
-        """Reset all fast buffers prior to starting a fresh episode."""
         allocate_fast_buffers(self.base, batch_size, device or next(self.parameters()).device)
 
     def cortex_parameters(self) -> Iterable[nn.Parameter]:
-        """Return parameters belonging to newly added Cortex components."""
+        # return only Cortex params (not base model)
         seen = set()
         for module in self.modules():
             if getattr(module, "is_cortex_param", False):
@@ -208,9 +195,6 @@ def load_qwen_with_cortex(
     torch_dtype: Optional[torch.dtype] = None,
     **from_pretrained_kwargs,
 ) -> CortexWrappedModel:
-    """
-    Load a Qwen model and retrofit Cortex sidecars on each decoder layer.
-    """
     cortex_cfg = cortex_cfg or CortexWrapConfig()
     base = AutoModelForCausalLM.from_pretrained(
         model_name, device_map=device_map, torch_dtype=torch_dtype, trust_remote_code=True, **from_pretrained_kwargs
@@ -221,17 +205,17 @@ def load_qwen_with_cortex(
 
 
 def attach_cortex_sidecars(wrapper: CortexWrappedModel) -> None:
-    """Attach CortexBlock modules to each decoder layer of the base transformer."""
+    # inject CortexBlock into each decoder layer
     if Qwen2DecoderLayer is None:
-        raise RuntimeError("Qwen2DecoderLayer unavailable. Ensure transformers with torch support is installed.")
+        raise RuntimeError("Qwen2DecoderLayer unavailable.")
 
     base_model = getattr(wrapper.base, "model", None)
     if base_model is None:
-        raise ValueError("Expected base model to expose a `.model` attribute with decoder layers.")
+        raise ValueError("Expected base.model attribute.")
 
     layers = getattr(base_model, "layers", None)
     if layers is None:
-        raise ValueError("Base model has no `.layers` attribute; unsupported architecture.")
+        raise ValueError("No .layers found.")
 
     cfg = wrapper.base.config
     cortex_layers = []
@@ -259,13 +243,12 @@ def attach_cortex_sidecars(wrapper: CortexWrappedModel) -> None:
 
 
 def _make_restore_hook(wrapper: CortexWrappedModel, layer_idx: int):
-    """Restore fast buffers from the active session before the layer executes."""
-
+    # pre-hook: restore U, V from session if available
     def hook(module: nn.Module, inputs):
         hidden_states = inputs[0]
         batch = hidden_states.shape[0]
         device = hidden_states.device
-        cortex_block: CortexBlock = module.cortex_block  # type: ignore[attr-defined]
+        cortex_block: CortexBlock = module.cortex_block
         session = wrapper._active_session
         if session is None:
             cortex_block.reset_fast(batch, device=device)
@@ -284,8 +267,7 @@ def _bind_cortex_forward(
     cortex_block: CortexBlock,
     layer_idx: int,
 ):
-    """Wrap decoder layer forward pass to include Cortex sidecar contribution."""
-
+    # replace layer forward to add cortex delta
     def forward_with_cortex(
         self,
         hidden_states: torch.Tensor,
