@@ -32,68 +32,35 @@ outputs = model(**inputs, session_id="chat_001", reset_session=True)
 
 ## Architecture
 
-### System Overview
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Frozen Base LLM                        │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐  │
-│  │              Transformer Layer 0                     │  │
-│  │                                                       │  │
-│  │  ┌──────────────┐         ┌──────────────────────┐  │  │
-│  │  │  Self-Attn   │ ◄─────► │  CortexBlock         │  │  │
-│  │  │  (frozen)    │         │  U[H,d,r], V[H,r,d]  │  │  │
-│  │  │              │         │  (trainable)         │  │  │
-│  │  └──────────────┘         └──────────────────────┘  │  │
-│  │         │                           │                │  │
-│  │         └─────── mixed output ──────┘                │  │
-│  │                                                       │  │
-│  └─────────────────────────────────────────────────────┘  │
-│                           ⋮                                │
-│  ┌─────────────────────────────────────────────────────┐  │
-│  │              Transformer Layer N                     │  │
-│  └─────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-         ▲                                        │
-         │                                        ▼
-    ┌────────────┐                        ┌──────────────┐
-    │ Controller │                        │ SessionState │
-    │    MLP     │                        │  (optional)  │
-    └────────────┘                        └──────────────┘
-    surprise, phase                       persist U,V
-    → plasticity gates                    across turns
-```
-
-### Per-Layer Detail
-
-```
-                  ┌──────────────────┐
-                  │   hidden state   │
-                  └────────┬─────────┘
-                           │
-              ┌────────────┴────────────┐
-              ▼                         ▼
-    ┌──────────────────┐    ┌─────────────────────┐
-    │   Base Attn      │    │   CortexBlock       │
-    │                  │    │                     │
-    │  q = W_Q h       │───►│  Read:              │
-    │  k = W_K h       │    │  k_u = U^T k        │
-    │  v = W_V h       │    │  U += α·k·k_u^T     │
-    │                  │    │  V += α·k_u·v^T     │
-    │  attn(q,k,v)     │    │                     │
-    │      │           │    │  y_fast = V(U^T q)  │
-    │      │           │    │      │              │
-    └──────┼───────────┘    └──────┼──────────────┘
-           │                       │
-           └───────┬───────────────┘
-                   ▼
-          y = σ(g)·y_fast + (1-σ(g))·v
-                   │
-                   ▼
-           ┌───────────────┐
-           │  next layer   │
-           └───────────────┘
+```mermaid
+graph TD
+    A["Hidden State h"] --> B["Base Attention<br/>(frozen)<br/>q = W_Q h<br/>k = W_K h<br/>v = W_V h"]
+    A --> C["CortexBlock<br/>(trainable)<br/>U[H,d,r], V[H,r,d]"]
+    
+    D["Controller MLP<br/>surprise, uncertainty<br/>reward, phase"] --> E["Plasticity Gates<br/>m_gate, alpha_scale"]
+    E --> C
+    
+    C --> F["Fast-Weight Update<br/>U *= 0.95<br/>V *= 0.95<br/>k_u = U^T k<br/>U += α·k·k_u^T<br/>V += α·k_u·v^T"]
+    F --> G["Fast Read<br/>y_fast = V(U^T q)"]
+    
+    B --> H["Slow Path<br/>attn(q,k,v)"]
+    G --> I["Mixing<br/>y = σ(g)·y_fast + (1-σ(g))·v"]
+    H --> I
+    
+    I --> J["Next Layer"]
+    
+    C -.-> K["SessionState<br/>(optional)<br/>persist U,V<br/>across turns"]
+    K -.-> C
+    
+    classDef frozen fill:#e8f4fd,stroke:#1976d2,stroke-width:2px
+    classDef trainable fill:#e8f5e8,stroke:#388e3c,stroke-width:2px
+    classDef controller fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    classDef output fill:#fff3e0,stroke:#f57c00,stroke-width:2px
+    
+    class B,H frozen
+    class C,F,G trainable
+    class D,E controller
+    class I,J output
 ```
 
 ### Components
@@ -430,25 +397,6 @@ Decay rate matters a lot:
 - 0.95: good balance
 - 0.98: remembers longer but can be unstable
 - 1.00: no forgetting → saturates and breaks
-
-## References
-
-Biological inspiration:
-- McClelland et al. (1995) - complementary learning systems
-- O'Reilly & Norman (2002) - hippocampus/cortex
-
-Fast weights:
-- Schmidhuber (1992) - original fast weight idea
-- Ba et al. (2016) - using fast weights to attend to the recent past
-- Schlag et al. (2021) - linear transformers with fast weights
-
-Continual learning:
-- Kirkpatrick et al. (2017) - EWC
-- Zenke et al. (2017) - synaptic intelligence
-
-Memory networks:
-- Graves et al. (2014) - Neural Turing Machines
-- Sukhbaatar et al. (2015) - End-to-end memory networks
 
 ## License
 
