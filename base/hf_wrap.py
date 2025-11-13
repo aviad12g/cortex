@@ -283,6 +283,10 @@ def _bind_cortex_forward(
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ):
+        # Unwrap if hidden_states is passed as tuple
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+            
         residual = hidden_states
         normed = self.input_layernorm(hidden_states)
         batch_size, seq_len = normed.size(0), normed.size(1)
