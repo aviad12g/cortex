@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import yaml
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from transformers import AutoTokenizer
 
 from base.hf_wrap import CortexWrapConfig, CortexWrappedModel, load_qwen_with_cortex
@@ -353,7 +353,7 @@ def main() -> None:
             all_samples.append(pair)
 
     optimizer = torch.optim.AdamW(model.cortex_parameters(), lr=args.lr_sidecar, weight_decay=0.0)
-    scaler = GradScaler(enabled=amp_enabled and device.type == "cuda")
+    scaler = GradScaler('cuda', enabled=amp_enabled and device.type == "cuda")
 
     probe_texts = build_probe_texts(2000, args.seed)
     baseline_ppl: Optional[float] = None
@@ -373,7 +373,7 @@ def main() -> None:
             labels = torch.tensor(sample["labels"], dtype=torch.long, device=device).unsqueeze(0)
             session_id = f"{run_id}_{sample['sample_id']}" if use_session else None
 
-            with autocast(enabled=amp_enabled and device.type == "cuda"):
+            with autocast(device_type="cuda", enabled=amp_enabled and device.type == "cuda"):
                 outputs = model(
                     input_ids=input_ids,
                     labels=labels,

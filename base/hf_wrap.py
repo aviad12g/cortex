@@ -284,7 +284,7 @@ def _bind_cortex_forward(
         batch_size, seq_len = normed.size(0), normed.size(1)
         m_gate, alpha_scale = wrapper._fetch_gates(batch_size, seq_len, normed.device)
 
-        attn_output, _ = self.self_attn(
+        attn_outputs = self.self_attn(
             hidden_states=normed,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -294,6 +294,7 @@ def _bind_cortex_forward(
             position_embeddings=position_embeddings,
             **kwargs,
         )
+        attn_output = attn_outputs[0]
         mix_mode = wrapper._mix_mode if wrapper._sidecar_enabled else "slow_only"
         cortex_delta = cortex_block(normed, m_gate, alpha_scale, mix_mode=mix_mode)
         wrapper._log_gate_stats(layer_idx, m_gate, alpha_scale)
@@ -306,6 +307,11 @@ def _bind_cortex_forward(
         hidden_states = self.post_attention_layernorm(hidden_states)
         mlp_out = self.mlp(hidden_states)
         hidden_states = residual + mlp_out
-        return hidden_states
+        
+        # Return tuple matching original forward signature
+        outputs = (hidden_states,)
+        if len(attn_outputs) > 1:
+            outputs += attn_outputs[1:]
+        return outputs
 
     return forward_with_cortex
