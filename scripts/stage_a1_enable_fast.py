@@ -128,7 +128,7 @@ def evaluate_probe_perplexity(
         for text in probe_texts:
             encoded = tokenizer(text, return_tensors="pt", truncation=True)
             encoded = {k: v.to(device) for k, v in encoded.items()}
-            outputs = model(**encoded, labels=encoded["input_ids"], session_id="probe", reset_session=True)
+            outputs = model(**encoded, labels=encoded["input_ids"], session_id="probe", reset_session=True, use_cache=False)
             losses.append(outputs.loss.item())
     model.train()
 
@@ -379,6 +379,7 @@ def main() -> None:
                     labels=labels,
                     session_id=session_id,
                     reset_session=True if use_session else False,
+                    use_cache=False,
                 )
                 loss = outputs.loss
 

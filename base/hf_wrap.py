@@ -312,10 +312,18 @@ def _bind_cortex_forward(
         mlp_out = self.mlp(hidden_states)
         hidden_states = residual + mlp_out
         
-        # Return tuple matching original forward signature
+        # Build outputs tuple matching what Qwen2Model expects
+        # Needs: (hidden_states, next_cache, [attentions])
         outputs = (hidden_states,)
+        
+        # Add cache if present (attn_outputs[1])
         if len(attn_outputs) > 1:
-            outputs += attn_outputs[1:]
+            outputs = outputs + (attn_outputs[1],)
+        
+        # Add attentions if present (attn_outputs[2])  
+        if len(attn_outputs) > 2:
+            outputs = outputs + (attn_outputs[2],)
+            
         return outputs
 
     return forward_with_cortex
