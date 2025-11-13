@@ -245,7 +245,10 @@ def attach_cortex_sidecars(wrapper: CortexWrappedModel) -> None:
 def _make_restore_hook(wrapper: CortexWrappedModel, layer_idx: int):
     # pre-hook: restore U, V from session if available
     def hook(module: nn.Module, inputs):
-        hidden_states = inputs[0]
+        if isinstance(inputs, tuple):
+            hidden_states = inputs[0]
+        else:
+            hidden_states = inputs
         batch = hidden_states.shape[0]
         device = hidden_states.device
         cortex_block: CortexBlock = module.cortex_block
