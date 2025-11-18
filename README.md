@@ -52,30 +52,30 @@ Cortex wraps a frozen base model, intercepting hidden states to inject memory dy
 ```mermaid
 graph TD
     subgraph "Frozen Base Model (Neocortex)"
-        L[Layer N Input] --> Attn[Multi-Head Attention]
-        L --> FFN[Feed-Forward Network]
+        L["Layer N Input"] --> Attn["Multi-Head Attention"]
+        L --> FFN["Feed-Forward Network"]
     end
 
     subgraph "Cortex Sidecar (Hippocampus)"
-        L --> P[Projections Q,K,V]
-        P --> SC[ShortConv1d]
-        SC --> GN[Gated DeltaNet]
+        L --> P["Projections Q,K,V"]
+        P --> SC["ShortConv1d"]
+        SC --> GN["Gated DeltaNet"]
         
         subgraph "Metacognitive Controller"
-            M1[Entropy H(p)] --> C[Controller MLP]
-            M2[Surprise -log(p)] --> C
+            M1["Entropy H(p)"] --> C["Controller MLP"]
+            M2["Surprise -log(p)"] --> C
             C -->|Gates α, β| GN
         end
         
-        GN -->|State S| MEM[Persistent Memory]
-        MEM -->|S| GN
-        GN --> OUT[Memory Output]
+        GN -->|"State S"| MEM["Persistent Memory"]
+        MEM -->|"S"| GN
+        GN --> OUT["Memory Output"]
     end
 
     Attn --> ADD(+)
     OUT --> ADD
     ADD --> FFN
-    FFN --> L_NEXT[Layer N+1]
+    FFN --> L_NEXT["Layer N+1"]
 ```
 
 ### 3.2. Information Flow: Training vs. Inference
@@ -115,18 +115,18 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    Input[Input Token] --> Model[Base Model]
-    Model --> Logits[Logits]
-    Logits --> Entropy[Entropy Calc]
-    Logits --> Surprise[Surprise Calc]
+    Input["Input Token"] --> Model["Base Model"]
+    Model --> Logits["Logits"]
+    Logits --> Entropy["Entropy Calc"]
+    Logits --> Surprise["Surprise Calc"]
     
-    Entropy --> Controller[Controller MLP]
+    Entropy --> Controller["Controller MLP"]
     Surprise --> Controller
     
-    Controller --> Alpha[Alpha (Forget)]
-    Controller --> Beta[Beta (Write)]
+    Controller --> Alpha["Alpha (Forget)"]
+    Controller --> Beta["Beta (Write)"]
     
-    Alpha --> Memory[Memory Update]
+    Alpha --> Memory["Memory Update"]
     Beta --> Memory
 ```
 
