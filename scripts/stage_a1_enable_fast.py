@@ -22,11 +22,15 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import yaml
-from torch.amp import GradScaler, autocast
+try:
+    from torch.amp import GradScaler, autocast
+except ImportError:
+    from torch.cuda.amp import GradScaler, autocast
 from transformers import AutoTokenizer
 
 from base.hf_wrap import CortexWrapConfig, CortexWrappedModel, load_qwen_with_cortex
 from train.data_long import NOISE_TOKENS, build_dataset, sample_to_training_pair
+from train.sleep import run_sleep_phase
 
 
 TASK_KEY_MAP = {
@@ -58,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--alpha_max", type=float, default=0.05)
-    parser.add_argument("--fast_rank", type=int, default=16)
+    parser.add_argument("--fast_rank", type=int, default=64)
     parser.add_argument("--fast_decay", type=float, default=0.95)
     parser.add_argument("--fast_beta", type=float, default=0.01)
     parser.add_argument("--lr_sidecar", type=float, default=2e-4)
@@ -69,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg", type=str, default=None)
     parser.add_argument("--run_id", type=str, default=None)
     parser.add_argument("--samples_per_gap", type=int, default=512)
+    parser.add_argument("--chunk_size", type=int, default=0, help="If > 0, split sequences into chunks for TBPTT")
     return parser.parse_args()
 
 
@@ -153,12 +158,19 @@ def summarize_fast_stats(
     for block in model._cortex_layers:
         if block.last_fast_share is not None and block.last_fast_share.numel() > 0:
             share = block.last_fast_share
-            if share.dim() == 3:
-                share = share[0]
-            if answer_idx.numel() > 0:
-                share_sel = share[answer_idx]
+            # If share is [B, T], we can index. If it's just [T] or [1], handle carefully.
+            if share.dim() == 2: # [B, T]
+                 share = share[0] # Take first batch item
+            
+            # Bounds check
+            if answer_idx.max() < share.size(0):
+                if answer_idx.numel() > 0:
+                    share_sel = share[answer_idx]
+                else:
+                    share_sel = share
             else:
                 share_sel = share
+                
             fast_layer_means.append(float(share_sel.mean().item()) if share_sel.numel() > 0 else 0.0)
         else:
             fast_layer_means.append(0.0)
@@ -372,22 +384,55 @@ def main() -> None:
             input_ids = torch.tensor(sample["input_ids"], dtype=torch.long, device=device).unsqueeze(0)
             labels = torch.tensor(sample["labels"], dtype=torch.long, device=device).unsqueeze(0)
             session_id = f"{run_id}_{sample['sample_id']}" if use_session else None
-
-            with autocast(device_type="cuda", enabled=amp_enabled and device.type == "cuda"):
-                outputs = model(
-                    input_ids=input_ids,
-                    labels=labels,
-                    session_id=session_id,
-                    reset_session=True if use_session else False,
-                    use_cache=False,
-                )
-                loss = outputs.loss
-
-            loss = loss / accum_steps
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
+            
+            # Chunking logic for TBPTT / Infinite Context
+            chunks = []
+            if args.chunk_size > 0 and input_ids.size(1) > args.chunk_size:
+                seq_len = input_ids.size(1)
+                for i in range(0, seq_len, args.chunk_size):
+                    end = min(i + args.chunk_size, seq_len)
+                    chunk_input = input_ids[:, i:end]
+                    chunk_labels = labels[:, i:end]
+                    chunks.append((chunk_input, chunk_labels, i == 0)) # (input, label, is_first)
             else:
-                loss.backward()
+                chunks.append((input_ids, labels, True))
+
+            total_loss = 0.0
+            
+            for chunk_idx, (c_input, c_labels, is_first) in enumerate(chunks):
+                # Only reset session on the first chunk of the sample
+                should_reset = True if (use_session and is_first) else False
+                
+                with autocast(enabled=amp_enabled and device.type == "cuda"):
+                    outputs = model(
+                        input_ids=c_input,
+                        labels=c_labels,
+                        session_id=session_id,
+                        reset_session=should_reset,
+                        use_cache=False,
+                    )
+                    loss = outputs.loss
+
+                # Scale loss by number of chunks to keep gradients comparable? 
+                # Or just accumulate gradients?
+                # Standard TBPTT: backward on each chunk.
+                loss = loss / accum_steps
+                
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward() # retain_graph=False is default
+                else:
+                    loss.backward()
+                
+                # Detach state in the model to break the graph for the NEXT chunk
+                # This is crucial for TBPTT within a single loop if session persistence is active
+                for block in model._cortex_layers:
+                    block.S = block.S.detach()
+                
+                total_loss += loss.item()
+                
+                # Compute metrics for the LAST chunk only to avoid spamming
+                if chunk_idx == len(chunks) - 1:
+                     metrics = compute_metrics(outputs, c_labels, tokenizer, model)
 
             if micro_step % accum_steps == 0:
                 if scaler.is_enabled():
@@ -402,8 +447,15 @@ def main() -> None:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 micro_step = 0
+                
+            # Sleep / Consolidation Trigger
+            # Run sleep phase every 500 global steps
+            if global_step % 500 == 0:
+                run_sleep_phase(model, None, tokenizer, device)
+                model.train() # Ensure we return to train mode
 
-            metrics = compute_metrics(outputs, labels, tokenizer, model)
+            if metrics is None: continue
+
             probe_entry = {
                 "run_id": run_id,
                 "variant": args.variant,

@@ -20,7 +20,7 @@ except Exception:
 
 @dataclass
 class CortexWrapConfig:
-    rank_fast: int = 16
+    rank_fast: int = 64
     decay: float = 0.95
     alpha_max: float = 0.05
     beta: float = 0.01
@@ -74,6 +74,21 @@ class CortexWrappedModel(nn.Module):
         outputs = self.base(*args, **kwargs)
 
         if session_state is not None:
+            if hasattr(outputs, "logits") and outputs.logits is not None:
+                # Calculate simple metrics for the controller
+                # We use detached logits to avoid affecting the computation graph
+                logits_det = outputs.logits.detach().float()
+                probs = torch.softmax(logits_det, dim=-1)
+                log_probs = torch.log_softmax(logits_det, dim=-1)
+                # Entropy = -sum(p * log_p)
+                entropy = -(probs * log_probs).sum(dim=-1).mean().item()
+                
+                loss_val = None
+                if hasattr(outputs, "loss") and outputs.loss is not None:
+                    loss_val = outputs.loss.item()
+                    
+                session_state.update_metrics(surprise=loss_val, uncertainty=entropy)
+
             self._persist_fast_buffers(session_state)
             session_state.advance(seq_len)
 
@@ -165,7 +180,8 @@ class CortexWrappedModel(nn.Module):
 
     def _persist_fast_buffers(self, session: SessionState) -> None:
         for idx, layer in enumerate(self._cortex_layers):
-            session.store_fast_buffer(idx, layer.U, layer.V)
+            # S is the only state now
+            session.store_fast_buffer(idx, layer.S, layer.S)
 
     def _log_gate_stats(self, layer_idx: int, m_gate: torch.Tensor, alpha_scale: torch.Tensor) -> None:
         controller_inputs = getattr(self, "_controller_inputs_cache", None)
@@ -226,10 +242,7 @@ def attach_cortex_sidecars(wrapper: CortexWrappedModel) -> None:
             CortexBlockConfig(
                 d_model=cfg.hidden_size,
                 n_heads=cfg.num_attention_heads,
-                rank_fast=wrapper.config.rank_fast,
-                decay=wrapper.config.decay,
-                alpha_max=wrapper.config.alpha_max,
-                beta=wrapper.config.beta,
+                d_head=wrapper.config.rank_fast,
             )
         )
         cortex_block.tie_projections(layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj, layer.self_attn.o_proj)
@@ -240,6 +253,22 @@ def attach_cortex_sidecars(wrapper: CortexWrappedModel) -> None:
         cortex_layers.append(cortex_block)
 
     wrapper._cortex_layers = tuple(cortex_layers)
+
+    # Monkey-patch the final norm to handle potential tuple propagation issues
+    if hasattr(wrapper.base.model, "norm"):
+        old_norm = wrapper.base.model.norm
+        
+        class SafeNorm(nn.Module):
+            def __init__(self, original_norm):
+                super().__init__()
+                self.original_norm = original_norm
+            
+            def forward(self, hidden_states):
+                while isinstance(hidden_states, (tuple, list)):
+                    hidden_states = hidden_states[0]
+                return self.original_norm(hidden_states)
+                
+        wrapper.base.model.norm = SafeNorm(old_norm)
 
 
 def _make_restore_hook(wrapper: CortexWrappedModel, layer_idx: int):
@@ -283,8 +312,12 @@ def _bind_cortex_forward(
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ):
+        # Debug Logging
+        with open("debug_cortex.log", "a") as f:
+             f.write(f"Layer {layer_idx} Input Type: {type(hidden_states)}\n")
+             
         # Unwrap if hidden_states is passed as tuple
-        if isinstance(hidden_states, tuple):
+        while isinstance(hidden_states, (tuple, list)):
             hidden_states = hidden_states[0]
             
         residual = hidden_states
@@ -316,18 +349,36 @@ def _bind_cortex_forward(
         mlp_out = self.mlp(hidden_states)
         hidden_states = residual + mlp_out
         
+        # Ensure hidden_states is a tensor
+        if isinstance(hidden_states, (tuple, list)):
+             print(f"DEBUG: Unwrapping hidden_states from {type(hidden_states)}", file=sys.stderr)
+             while isinstance(hidden_states, (tuple, list)):
+                 hidden_states = hidden_states[0]
+
+        if not isinstance(hidden_states, torch.Tensor):
+            print(f"CRITICAL: hidden_states ended up as {type(hidden_states)}", file=sys.stderr)
+            # Emergency fallback if somehow we got a non-tensor
+            if hasattr(hidden_states, 'tensor'): 
+                hidden_states = hidden_states.tensor
+        
         # Build outputs tuple matching what Qwen2Model expects
-        # Needs: (hidden_states, next_cache, [attentions])
+        # Qwen2 expectations: (hidden_states, present_key_value, all_hidden_states, all_self_attns)
+        
+        # 1. Hidden States (Tensor)
         outputs = (hidden_states,)
         
-        # Add cache if present (attn_outputs[1])
+        # 2. Present Key Value (Cache) - from attn_outputs[1]
         if len(attn_outputs) > 1:
-            outputs = outputs + (attn_outputs[1],)
+            outputs += (attn_outputs[1],)
         
-        # Add attentions if present (attn_outputs[2])  
+        # 3. Attentions - from attn_outputs[2]
         if len(attn_outputs) > 2:
-            outputs = outputs + (attn_outputs[2],)
-            
+            outputs += (attn_outputs[2],)
+
+        with open("debug_cortex.log", "a") as f:
+             f.write(f"Layer {layer_idx} Output Type: {type(outputs)} of len {len(outputs)}\n")
+             f.write(f"Layer {layer_idx} Output[0] Type: {type(outputs[0])}\n")
+
         return outputs
 
     return forward_with_cortex

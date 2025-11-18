@@ -1,0 +1,9 @@
+logs/
+logs_infinite/
+checkpoints/
+checkpoints_infinite/
+*.log
+__pycache__/
+*.pt
+.DS_Store
+

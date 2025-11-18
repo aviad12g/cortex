@@ -1,158 +1,195 @@
-"""Fast-weight sidecar that sits alongside base attention."""
+"""Fast-weight sidecar implementing Gated Delta Rule (Yang et al., 2025)."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass
 class CortexBlockConfig:
     d_model: int
     n_heads: int
-    rank_fast: int = 16
-    decay: float = 0.95
-    alpha_max: float = 0.05
-    beta: float = 0.01
-    eps: float = 1e-5  # unused for now
+    d_head: int = 64  # Default from Gated DeltaNet paper
+    conv_kernel: int = 4
+    
+    # Hyperparameters for Gated Delta Rule
+    # These can be learned or fixed
+    use_short_conv: bool = True
+    use_output_gate: bool = True
 
 
 class CortexBlock(nn.Module):
-    """Low-rank fast weights (U, V) that get updated online per token."""
+    """
+    Gated DeltaNet Block.
+    
+    Implements the update rule:
+    S_t = S_{t-1} * alpha_t * (I - beta_t * k_t * k_t^T) + beta_t * v_t * k_t^T
+    
+    Simplified for efficient computation:
+    v_old = S_{t-1} @ k_t
+    S_t = alpha_t * S_{t-1} + beta_t * (v_t - alpha_t * v_old) @ k_t^T
+    """
 
     is_cortex_param = True
 
     def __init__(self, cfg: CortexBlockConfig):
         super().__init__()
         self.cfg = cfg
-        assert cfg.d_model % cfg.n_heads == 0
-        self.d_head = cfg.d_model // cfg.n_heads
-
-        # U, V buffers - not persistent, reset each batch
+        self.d_head = cfg.d_head
+        self.n_heads = cfg.n_heads
+        self.d_model = cfg.d_model
+        
+        # Projections
+        self.q_proj = nn.Linear(cfg.d_model, cfg.n_heads * cfg.d_head, bias=False)
+        self.k_proj = nn.Linear(cfg.d_model, cfg.n_heads * cfg.d_head, bias=False)
+        self.v_proj = nn.Linear(cfg.d_model, cfg.n_heads * cfg.d_head, bias=False)
+        
+        # Gating projections (alpha = forget, beta = write strength)
+        # Projecting from d_model to n_heads (scalar per head)
+        self.alpha_proj = nn.Linear(cfg.d_model, cfg.n_heads, bias=True)
+        self.beta_proj = nn.Linear(cfg.d_model, cfg.n_heads, bias=True)
+        
+        # Short Convolution (Depthwise)
+        if cfg.use_short_conv:
+            self.conv_q = nn.Conv1d(cfg.n_heads * cfg.d_head, cfg.n_heads * cfg.d_head, 
+                                    kernel_size=cfg.conv_kernel, groups=cfg.n_heads * cfg.d_head, padding=cfg.conv_kernel-1)
+            self.conv_k = nn.Conv1d(cfg.n_heads * cfg.d_head, cfg.n_heads * cfg.d_head,
+                                    kernel_size=cfg.conv_kernel, groups=cfg.n_heads * cfg.d_head, padding=cfg.conv_kernel-1)
+            self.conv_v = nn.Conv1d(cfg.n_heads * cfg.d_head, cfg.n_heads * cfg.d_head,
+                                    kernel_size=cfg.conv_kernel, groups=cfg.n_heads * cfg.d_head, padding=cfg.conv_kernel-1)
+        
+        # Output projection
+        self.o_proj = nn.Linear(cfg.n_heads * cfg.d_head, cfg.d_model, bias=False)
+        
+        if cfg.use_output_gate:
+            self.g_proj = nn.Linear(cfg.d_model, cfg.n_heads * cfg.d_head, bias=True)
+            
+        # Layer Norms / Group Norms could be added here as per paper, 
+        # but for sidecar usage, we stick to simple structures first.
+        
+        # Fast Weight State (S)
+        # Buffer shape: [1, H, D, D]
         self.register_buffer(
-            "U",
-            torch.zeros(1, cfg.n_heads, self.d_head, cfg.rank_fast),
-            persistent=False,
-        )
-        self.register_buffer(
-            "V",
-            torch.zeros(1, cfg.n_heads, cfg.rank_fast, self.d_head),
+            "S",
+            torch.zeros(1, cfg.n_heads, cfg.d_head, cfg.d_head),
             persistent=False
         )
 
-        self.alpha_proj = nn.Linear(cfg.d_model, cfg.n_heads)
-        self.mix_logit = nn.Parameter(torch.zeros(cfg.n_heads))
-
-        # QKV projections - will be tied to base model later
-        self.q_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.k_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.v_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.o_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-
-        # tracking for analysis
-        self.last_fast_share = None
-        self.last_alpha = None
-
+    def load_fast(self, U: torch.Tensor, V: Optional[torch.Tensor] = None) -> None:
+        # We only use one buffer 'S' now (combining U and V in the new architecture)
+        # If V is passed (legacy), ignore it or assume U contains S
+        self.S = U
     def reset_fast(self, batch_size: int, device: Optional[torch.device] = None) -> None:
-        device = device or self.U.device
-        self.U.resize_(batch_size, self.cfg.n_heads, self.d_head, self.cfg.rank_fast).zero_()
-        self.V.resize_(batch_size, self.cfg.n_heads, self.cfg.rank_fast, self.d_head).zero_()
-
-    def load_fast(self, U: torch.Tensor, V: torch.Tensor) -> None:
-        self.U.resize_as_(U).copy_(U)
-        self.V.resize_as_(V).copy_(V)
-
-    def _clamp_update(self, tensor: torch.Tensor) -> torch.Tensor:
-        return torch.clamp(tensor, min=-1.0, max=1.0)
+        device = device or self.S.device
+        if self.S.shape[0] != batch_size or self.S.device != device:
+             self.S = torch.zeros(batch_size, self.cfg.n_heads, self.d_head, self.d_head, device=device)
+        else:
+            self.S.zero_()
 
     def tie_projections(self, q_proj: nn.Linear, k_proj: nn.Linear, v_proj: nn.Linear, o_proj: nn.Linear) -> None:
-        # share QKV weights with base model, freeze them
-        with torch.no_grad():
-            self.q_proj.weight.copy_(q_proj.weight)
-            self.k_proj.weight.copy_(k_proj.weight)
-            self.v_proj.weight.copy_(v_proj.weight)
-            self.o_proj.weight.copy_(o_proj.weight)
-        for layer in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
-            layer.weight.requires_grad = False
+        pass
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        m_gate: torch.Tensor,
-        alpha_scale: torch.Tensor,
+        m_gate: Optional[torch.Tensor] = None, 
+        alpha_scale: Optional[torch.Tensor] = None, 
         mix_mode: str = "dual",
     ) -> torch.Tensor:
-        # hidden_states: [B, T, D]
-        # m_gate: [B, T] plasticity
-        # alpha_scale: [B, T, H] per-head scale
-        B, T, _ = hidden_states.shape
-        if self.U.shape[0] != B:
+        B, T, D = hidden_states.shape
+        if self.S.shape[0] != B:
             self.reset_fast(B, device=hidden_states.device)
 
-        deltas = []
-        fast_share_accum = []
-        alpha_accum = []
-        self.last_fast_share = None
-        self.last_alpha = None
+        # 1. Projections
+        q = self.q_proj(hidden_states) # [B, T, H*D_head]
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        
+        # 2. Transpose for Conv1d: [B, C, T]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # 3. Short Conv (Causal)
+        if self.cfg.use_short_conv:
+            q = self.conv_q(q)[:, :, :T]
+            k = self.conv_k(k)[:, :, :T]
+            v = self.conv_v(v)[:, :, :T]
+            
+        # 4. Activations & Norms
+        q = F.silu(q)
+        k = F.silu(k)
+        v = F.silu(v) 
+        
+        # L2 Norm on k (crucial for DeltaNet stability)
+        k = k.transpose(1, 2).view(B, T, self.n_heads, self.d_head)
+        k = F.normalize(k, p=2, dim=-1)
+        
+        q = q.transpose(1, 2).view(B, T, self.n_heads, self.d_head)
+        v = v.transpose(1, 2).view(B, T, self.n_heads, self.d_head)
+        
+        # 5. Compute Gating Factors
+        alpha_logits = self.alpha_proj(hidden_states) # [B, T, H]
+        beta_logits = self.beta_proj(hidden_states)   # [B, T, H]
+        
+        alpha = torch.sigmoid(alpha_logits)
+        beta = torch.sigmoid(beta_logits)
+        
+        if m_gate is not None:
+             alpha = alpha * m_gate.unsqueeze(-1)
+             beta = beta * m_gate.unsqueeze(-1)
+
+        outputs = []
         
         for t in range(T):
-            h_t = hidden_states[:, t, :]
-            q = self.q_proj(h_t).view(B, self.cfg.n_heads, self.d_head)
-            k = self.k_proj(h_t).view(B, self.cfg.n_heads, self.d_head)
-            v = self.v_proj(h_t).view(B, self.cfg.n_heads, self.d_head)
-
-            with torch.no_grad():
-                # compute effective plasticity
-                alpha = torch.sigmoid(self.alpha_proj(h_t))
-                alpha = alpha * m_gate[:, t].unsqueeze(-1)
-                alpha = alpha * alpha_scale[:, t, :]
-                if self.cfg.alpha_max is not None:
-                    alpha = torch.clamp(alpha, max=self.cfg.alpha_max)
-
-                # decay
-                self.U.mul_(self.cfg.decay)
-                self.V.mul_(self.cfg.decay)
-
-                # Hebbian update: project k through U, then outer product back
-                ku = torch.einsum("bhd,bhdr->bhr", k, self.U)
-                self.U.add_(
-                    alpha.unsqueeze(-1).unsqueeze(-1) * torch.einsum("bhd,bhr->bhdr", k, ku)
-                )
-                self.V.add_(
-                    alpha.unsqueeze(-1).unsqueeze(-1) * torch.einsum("bhr,bhd->bhrd", ku, v)
-                )
-                # anti-Hebbian to prevent saturation
-                self.U.add_(-self.cfg.beta * self._clamp_update(self.U))
-                self.V.add_(-self.cfg.beta * self._clamp_update(self.V))
-
-            q_norm = q / (self.d_head**0.5)
-            k_fast = torch.einsum("bhdr,bhrd->bhd", self.U, self.V)
-            v_fast = k_fast
-
-            score_slow = torch.einsum("bhd,bhd->bh", q_norm, k)
-            score_fast = torch.einsum("bhd,bhd->bh", q_norm, k_fast)
-
-            mix_logits = torch.stack([score_slow, score_fast], dim=-1) + self.mix_logit.view(1, -1, 1)
-            mix = torch.softmax(mix_logits, dim=-1)
-            if mix_mode == "slow_only":
-                mix = mix.clone()
-                mix[..., 0] = 1.0
-                mix[..., 1] = 0.0
-
-            y = mix[..., 0].unsqueeze(-1) * v + mix[..., 1].unsqueeze(-1) * v_fast
-            y = y.reshape(B, -1)
-            delta = self.o_proj(y)
-            deltas.append(delta.unsqueeze(1))
-            fast_share_accum.append(mix[..., 1].unsqueeze(1))
-            alpha_accum.append(alpha.unsqueeze(1))
-
-        if fast_share_accum:
-            self.last_fast_share = torch.cat(fast_share_accum, dim=1).detach().cpu()
-        else:
-            self.last_fast_share = None
-        if alpha_accum:
-            self.last_alpha = torch.cat(alpha_accum, dim=1).detach().cpu()
-        else:
-            self.last_alpha = None
-        return torch.cat(deltas, dim=1)
+            kt = k[:, t] # [B, H, D]
+            vt = v[:, t] # [B, H, D]
+            qt = q[:, t] # [B, H, D]
+            at = alpha[:, t, :, None, None] # [B, H, 1, 1]
+            bt = beta[:, t, :, None, None]  # [B, H, 1, 1]
+            
+            # v_old = S_{t-1} @ k_t
+            # S: [B, H, D, D]
+            # kt: [B, H, D] -> [B, H, D, 1]
+            v_old = torch.matmul(self.S, kt.unsqueeze(-1)).squeeze(-1) # [B, H, D]
+            
+            # Update term
+            # at is [B, H, 1, 1], we need [B, H, 1] for broadcasting with v_old [B, H, D]
+            update_val = vt - at.squeeze(-1) * v_old
+            
+            # delta_S
+            delta_S = torch.matmul(update_val.unsqueeze(-1), kt.unsqueeze(-2))
+            
+            # In-place update might cause issues with autograd if not careful, 
+            # but here we overwrite self.S. 
+            # For backprop through time, this sequential overwrite is fine in eager mode 
+            # (PyTorch tracks versions).
+            # To avoid 'in-place' error on S during backward if needed:
+            S_next = at * self.S.clone() + bt * delta_S
+            
+            # STABILITY FIX: Clamp state to prevent explosion
+            self.S = torch.clamp(S_next, -5.0, 5.0)
+            
+            # Read: o_t = S_t @ q_t
+            ot = torch.matmul(self.S, qt.unsqueeze(-1)).squeeze(-1) # [B, H, D]
+            outputs.append(ot)
+            
+        y = torch.stack(outputs, dim=1) # [B, T, H, D]
+        
+        # 7. Output Gate & Projection
+        y = y.view(B, T, self.n_heads * self.d_head)
+        
+        if self.cfg.use_output_gate:
+            g = F.silu(self.g_proj(hidden_states))
+            y = y * g
+            
+        out = self.o_proj(y)
+        
+        # Telemetry for logs
+        self.last_fast_share = y.detach().mean(dim=-1) # Proxy for "how much fast weight contributed"
+        self.last_alpha = alpha.detach()
+        
+        return out

@@ -35,7 +35,14 @@ class SessionState:
         self.uncertainty_level = 0.0
         self.reward_level = 0.0
 
+    def update_metrics(self, surprise: Optional[float] = None, uncertainty: Optional[float] = None, decay: float = 0.9) -> None:
+        if surprise is not None:
+            self.surprise_level = decay * self.surprise_level + (1 - decay) * surprise
+        if uncertainty is not None:
+            self.uncertainty_level = decay * self.uncertainty_level + (1 - decay) * uncertainty
+
     def store_fast_buffer(self, layer_idx: int, U: torch.Tensor, V: torch.Tensor) -> None:
+        # Detach to stop gradient flow between chunks (Truncated BPTT)
         self.fast_buffers[layer_idx] = FastBufferSnapshot(U.detach().clone(), V.detach().clone())
 
     def get_fast_buffer(self, layer_idx: int) -> Optional[FastBufferSnapshot]:

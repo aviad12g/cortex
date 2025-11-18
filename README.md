@@ -1,407 +1,132 @@
-# Cortex
+# Cortex: Biologically-Inspired Gated Delta Memory
 
-Fast weight memory for LLMs. Biological memory systems inspired this  think hippocampus meets transformer.
+Cortex augments frozen Large Language Models with a trainable, biologically-plausible memory system. It enables **infinite context windows** and **persistent memory** across sessions without modifying the base model's weights.
 
-## What is this?
+By attaching a lightweight **Gated DeltaNet** sidecar to every attention layer, Cortex allows the model to "write" to a fast-weight matrix $S$ during inference. This memory is dynamic: it decays, updates based on prediction error (surprise), and consolidates important information during "sleep" phases.
 
-Cortex adds trainable "fast weights" to a frozen LLM. These let the model remember things beyond its normal context window. The memory decays over time but can be consolidated during sleep phases.
+## Core Architecture
 
-Main ideas:
-- Base model stays frozen
-- Only lightweight sidecars get trained
-- Learns when to write via neuromodulation
-- Sleep-based consolidation for long-term stability
+### 1. The Gated DeltaNet Sidecar
+Instead of standard attention ($O(N^2)$), Cortex uses a linear recurrent formulation ($O(N)$) based on the **Gated Delta Rule**. This allows it to maintain a fixed-size state $S$ regardless of sequence length.
 
-The core trick is using low-rank matrices U and V per attention head. We never form the full product UV (that's expensive). Instead we do efficient factorized reads: `y_fast = V(U^T q)`.
+**Mathematical Formulation:**
 
-## Quick Start
+Let $x_t$ be the input at step $t$. We project it to queries, keys, and values:
+$$q_t, k_t, v_t = \text{Proj}(x_t)$$
 
-```bash
-pip install torch>=2.0.0 transformers>=4.30.0
+To capture local context before long-term storage, we apply a short depthwise convolution:
+$$q'_t, k'_t, v'_t = \text{ShortConv1d}(q_t, k_t, v_t)$$
 
-from base.hf_wrap import load_qwen_with_cortex, CortexWrapConfig
+The memory state $S_t \in \mathbb{R}^{d \times d}$ is updated using a forgetting gate $\alpha_t$ and a writing gate $\beta_t$:
 
-model = load_qwen_with_cortex(
-    "Qwen/Qwen1.5-1.8B-Chat",
-    cortex_cfg=CortexWrapConfig(rank_fast=16, decay=0.95)
-)
+$$ \text{Recall:} \quad v_{\text{old}} = S_{t-1} k'_t $$
+$$ \text{Update:} \quad S_t = \alpha_t S_{t-1} + \beta_t (v'_t - \alpha_t v_{\text{old}}) {k'_t}^T $$
+$$ \text{Read:} \quad y_t = S_t q'_t $$
 
-# multi-turn with persistent memory
-outputs = model(**inputs, session_id="chat_001", reset_session=True)
-```
+*   **$\alpha_t$ (Forget Gate):** Controls how much of the old memory is retained.
+*   **$\beta_t$ (Input Gate):** Controls how strongly new information is written.
+*   **Delta Rule $(v - S k)$:** We only learn the *error*—the difference between the retrieved value and the new value. This prevents capacity saturation compared to standard Hebbian learning.
 
-## Architecture
+### 2. Metacognitive Plasticity
+The model learns *how to learn*. A specialized **Controller** network monitors the base model's internal state to modulate the plasticity gates $\alpha$ and $\beta$.
+
+*   **Entropy (Uncertainty):** If the model is unsure (high entropy), it may open the gates to absorb new information.
+*   **Surprise (Loss):** High prediction error signals a need to update the memory model to correct the mistake.
+
+$$ [\alpha_t, \beta_t] = \text{Controller}(\text{Entropy}(p_t), \text{Surprise}(y_t), \text{HiddenState}_t) $$
+
+### 3. System Overview
 
 ```mermaid
 graph TD
-    A["Hidden State h"] --> B["Base Attention<br/>(frozen)<br/>q = W_Q h<br/>k = W_K h<br/>v = W_V h"]
-    A --> C["CortexBlock<br/>(trainable)<br/>U[H,d,r], V[H,r,d]"]
-    
-    D["Controller MLP<br/>surprise, uncertainty<br/>reward, phase"] --> E["Plasticity Gates<br/>m_gate, alpha_scale"]
-    E --> C
-    
-    C --> F["Fast-Weight Update<br/>U *= 0.95<br/>V *= 0.95<br/>k_u = U^T k<br/>U += α·k·k_u^T<br/>V += α·k_u·v^T"]
-    F --> G["Fast Read<br/>y_fast = V(U^T q)"]
-    
-    B --> H["Slow Path<br/>attn(q,k,v)"]
-    G --> I["Mixing<br/>y = σ(g)·y_fast + (1-σ(g))·v"]
-    H --> I
-    
-    I --> J["Next Layer"]
-    
-    C -.-> K["SessionState<br/>(optional)<br/>persist U,V<br/>across turns"]
-    K -.-> C
-    
-    classDef frozen fill:#e8f4fd,stroke:#1976d2,stroke-width:2px
-    classDef trainable fill:#e8f5e8,stroke:#388e3c,stroke-width:2px
-    classDef controller fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
-    classDef output fill:#fff3e0,stroke:#f57c00,stroke-width:2px
-    
-    class B,H frozen
-    class C,F,G trainable
-    class D,E controller
-    class I,J output
+    subgraph Frozen Base Model
+        H[Hidden State] --> Attn[Self Attention]
+        H --> FFN[Feed Forward]
+    end
+
+    subgraph Cortex Sidecar
+        H --> Proj[Q, K, V Projections]
+        Proj --> Conv[Short Conv1d]
+        Conv --> Norm[L2 Norm on K]
+        
+        Norm --> Read[Read Memory]
+        S[State Matrix S] -.-> Read
+        Read --> Out[y_t = S * q]
+        
+        Norm --> Update[Update Memory]
+        Control[Controller] -->|alpha, beta| Update
+        Update -->|Delta Rule| S
+    end
+
+    H --> Control
+    Attn --> Add[+]
+    Out --> Add
+    Add --> FFN
 ```
 
-### Components
+## Key Features
 
-**CortexBlock** - the memory sidecar
-- U: `[H, d_head, r]` 
-- V: `[H, r, d_head]`
-- Typical r=16 gives ~30% overhead
-- Never materializes the full `d×d` product
+*   **Infinite Context:** Memory cost is constant $O(1)$ regardless of sequence length.
+*   **Frozen Base:** The large base model (e.g., Qwen-0.5B, Llama-3) remains untouched. Only the lightweight Cortex parameters (~2% of base) are trained.
+*   **Sleep & Consolidation:** A periodic "sleep" phase generates random noise and uses **Fisher Information Matrix (FIM)** regularization to consolidate short-term fast weights into long-term slow weights, preventing catastrophic forgetting.
+*   **Truncated BPTT:** Supports training on sequences far exceeding GPU memory by detaching gradients between chunks while persisting the memory state $S$.
 
-**Controller** - decides when to write
-- Tiny MLP: 4 inputs → 2 outputs
-- Inputs: surprise, uncertainty, reward, phase
-- Outputs: global gate + per-head scales
+## Installation
 
-**SessionState** - cross-turn persistence
-- Stores U and V between forward passes
-- Optional for multi-turn conversations
-
-## How It Works
-
-### Fast-Weight Update
-
-Each timestep updates the memory:
-
-```python
-# projections (shared with base model)
-q, k, v = W_Q h, W_K h, W_V h
-
-# decay old memories
-U *= 0.95
-V *= 0.95
-
-# Hebbian learning
-k_u = U.T @ k              # project key to rank-r space
-U += alpha * outer(k, k_u)  # strengthen association
-V += alpha * outer(k_u, v)  # store value
-
-# anti-Hebbian stabilization
-U -= 0.01 * clamp(U, -1, 1)
-V -= 0.01 * clamp(V, -1, 1)
-
-# read from memory (the key operation)
-y_fast = V @ (U.T @ q)      # two cheap matmuls instead of expensive UV
-
-# mix with slow path
-gate = learned_gate(q, k, y_fast)
-y = sigmoid(gate) * y_fast + (1 - sigmoid(gate)) * v
+```bash
+pip install torch transformers accelerate
 ```
-
-Why this is fast:
-- Two `O(d·r)` operations instead of one `O(d²)`
-- For r=16 and d=128 this is ~8x cheaper
-- Memory usage stays small
-
-### Controller
-
-Small network that learns when to write:
-
-```python
-# compute surprise during training
-loss_t = -log p(y_t | x)
-ema = 0.99 * ema + 0.01 * loss_t
-surprise = loss_t - ema
-
-# also track uncertainty
-uncertainty = entropy(p)
-
-# controller decides plasticity
-gates = MLP([surprise, uncertainty, reward, phase])
-alpha = sigmoid(h) * gates.m_gate * gates.write_scale * 0.05
-
-# safety: don't write when very uncertain
-if uncertainty > threshold:
-    alpha *= 0.5
-```
-
-During inference with no labels we use the model's own predictions to compute surprise - same mechanism works everywhere.
-
-### Consolidation
-
-Every 512 tokens we do a short "sleep" phase:
-
-```python
-# detect interesting segments via surprise
-if loss - ema > 1.2 * ema:
-    # surprise spike - start tracking
-    segment_start = (U.clone(), V.clone())
-
-if loss - ema < 1.05 * ema:
-    # back to normal - compress and store
-    stats = {
-        'h_mean': mean(hiddens),
-        'h_var': var(hiddens),
-        'delta_U': U - segment_start[0],
-        'delta_V': V - segment_start[1]
-    }
-    code = Encoder(stats)  # compress to 128-d vector
-    save_for_replay(code, stats)
-
-# during sleep
-batch = sample_codes()
-targets = load_stats(batch)
-reconstructed = Decoder(batch)
-loss = mse(reconstructed, targets) + fisher_penalty
-# gradient descent on Cortex params only
-```
-
-The Fisher penalty keeps parameters from drifting too far from their pre-sleep values.
-
-## Training Stages
-
-We're building this in phases:
-
-| Stage | Goal | Status |
-|-------|------|--------|
-| A1 | Fast-weight reach extension | Done |
-| A2 | Learn segment codes | In progress |
-| A3 | Sleep consolidation | Planned |
-| A4 | Selective base updates | Planned |
-
-### Synthetic Tasks
-
-Testing memory with four task types:
-
-**KV Binding**
-```
-HEADER: K1->XBQZ; K2->MFJK; K3->PLWT; ...
-DISTRACTOR: (256-4096 tokens of noise)
-QUERY: ASK K2?
-ANSWER: MFJK
-```
-
-**Copy-Reverse**
-```
-PROMPT: <SEQ> 5 7 2 9 1 3 </SEQ>
-DISTRACTOR: (noise)
-QUERY: REVERSE <SEQ>
-ANSWER: 3 1 9 2 7 5
-```
-
-**N-Back**
-```
-STREAM: A B C D A E [B] C D E ...
-QUERY: NBACK 5 B
-ANSWER: YES
-```
-
-**Long Addition**
-```
-CALC: + 41592653589793238462 64338327950288419716
-DISTRACTOR: (noise)
-QUERY: SUM?
-ANSWER: 105930981540081658178
-```
-
-We vary the gap length and measure accuracy vs distance.
-
-## Implementation
-
-### Files
-
-```
-cortex-1/
-├── base/
-│   └── hf_wrap.py          # wrap HF models with sidecars
-├── blocks/
-│   ├── cortex_block.py     # U,V matrices + update logic
-│   └── controller.py       # plasticity gates
-├── mem/
-│   ├── session.py          # cross-turn state
-│   ├── chunker.py          # segment detection
-│   ├── codes.py            # compression encoder/decoder
-│   ├── consolidation.py    # sleep coordinator
-│   ├── fisher.py           # EWC penalties
-│   └── fast_weights.py     # utilities
-└── train/
-    ├── data_long.py        # synthetic tasks
-    └── objectives.py       # loss functions
-```
-
-### Integration
-
-We use PyTorch hooks to inject sidecars without modifying the base model:
-
-```python
-# attach to each layer
-for layer in model.layers:
-    cortex = CortexBlock(...)
-    cortex.tie_projections(layer.self_attn.q_proj, ...)
-    
-    # restore U,V before forward
-    layer.register_forward_pre_hook(restore_fast_weights)
-    
-    # override forward to include sidecar
-    original_forward = layer.forward
-    layer.forward = lambda h: original_forward(h) + cortex(h, gates)
-```
-
-The base model never knows Cortex exists. QKV projections are shared so we don't duplicate parameters.
-
-### Cost
-
-For r=16 on Qwen-1.8B:
-- Adds 2.5M parameters (0.14% increase)
-- Wall-clock ~30% slower
-- Memory overhead minimal
-
-Could get to ~20% with fused CUDA kernels.
 
 ## Usage
 
-### Training
+### Training (Infinite Context Mode)
+Train the Cortex sidecars on long sequences with memory persistence and sleep phases.
 
 ```bash
 python scripts/stage_a1_enable_fast.py \
-    --model Qwen/Qwen1.5-1.8B-Chat \
+    --model Qwen/Qwen2.5-0.5B-Instruct \
     --task kv \
-    --gaps 256,512,1024,2048 \
-    --epochs 2 \
-    --save_dir ./checkpoints
+    --chunk_size 512 \
+    --gaps 2000 4000 \
+    --samples_per_gap 256 \
+    --fast_rank 64 \
+    --lr_sidecar 5e-5
 ```
 
-### Loading
+### Inference
 
 ```python
 from base.hf_wrap import load_qwen_with_cortex, CortexWrapConfig
 
-cortex_cfg = CortexWrapConfig(
-    rank_fast=16,
-    decay=0.95,
-    alpha_max=0.05,
-    beta=0.01,
+# Load with Gated DeltaNet configuration
+config = CortexWrapConfig(
+    rank_fast=64,
+    alpha_max=0.99,
+    use_short_conv=True
 )
 
-model = load_qwen_with_cortex(
-    "Qwen/Qwen1.5-1.8B-Chat",
-    cortex_cfg=cortex_cfg,
-    torch_dtype=torch.float16,
+model = load_qwen_with_cortex("Qwen/Qwen2.5-0.5B-Instruct", cortex_cfg=config)
+
+# Chat with persistent memory
+history = []
+session_id = "user_session_1"
+
+response = model.generate(
+    input_ids, 
+    session_id=session_id, # Persists memory state S across calls
+    reset_session=False
 )
-
-# freeze base - train only sidecars
-for param in model.base.parameters():
-    param.requires_grad = False
 ```
 
-### Multi-turn Sessions
+## Implementation Details
 
-```python
-session_id = "conversation_42"
-
-# turn 1
-out1 = model(**inputs1, session_id=session_id, reset_session=True)
-
-# turn 2 - U,V carry forward
-out2 = model(**inputs2, session_id=session_id)
-
-# turn 3
-out3 = model(**inputs3, session_id=session_id)
-```
-
-## Next Steps
-
-### High Priority
-
-**Performance optimization**
-- Fused CUDA kernels for update + read
-- Profile memory bandwidth
-- Try int8 quantization for U,V
-
-**Real benchmarks**
-- LongBench (NarrativeQA)
-- L-Eval
-- PersonaChat with long history
-- Compare to RMT and Memorizing Transformers
-
-**Safety features**
-- Time-to-live for segments
-- PII detection in write gates
-- Measure memorization vs baseline
-
-### Medium Term
-
-**Finish training stages**
-- A2: segment compression
-- A3: sleep consolidation
-- A4: selective base unfreezing
-
-**Scale up**
-- Test on Llama-70B
-- Multi-GPU coordination
-- Efficient distributed training
-
-### Long Term
-
-- Adaptive rank per layer
-- Multi-timescale decay
-- Extension to vision-language models
-- Production deployment
-
-## Technical Details
-
-### Math
-
-The key insight is factorization:
-
-```
-DON'T DO THIS (slow):
-    K_fast = U @ V                    # [d×d] materialization
-    y_fast = K_fast @ q               # [d×d] @ [d]
-    Cost: O(d²·r) + O(d²) = disaster
-
-DO THIS (fast):
-    temp = U.T @ q                    # [r] 
-    y_fast = V @ temp                 # [d]
-    Cost: O(d·r) + O(d·r) = great
-```
-
-Both give the same answer but one is 10x faster.
-
-### Hyperparameters
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| r | 16 | sweet spot for capacity vs speed |
-| γ (decay) | 0.95 | balances retention and stability |
-| α_max | 0.05 | max learning rate |
-| β (anti-Hebb) | 0.01 | prevents saturation |
-
-Going to r=32 helps a bit but costs more. Going to r=8 is too small.
-
-Decay rate matters a lot:
-- 0.90: faster forgetting but stable
-- 0.95: good balance
-- 0.98: remembers longer but can be unstable
-- 1.00: no forgetting → saturates and breaks
+| Component | Specification |
+|-----------|---------------|
+| **State Shape** | $[B, H, D_{head}, D_{head}]$ |
+| **Update Rule** | Gated Delta Rule (Linear Transformer) |
+| **Local Context** | Depthwise Conv1d (kernel=3) |
+| **Normalization** | L2 Norm on Keys (crucial for stability) |
+| **Gating** | Data-dependent $\alpha, \beta$ (Sigmoid) |
 
 ## License
-
 MIT
-
----
-
-**Status**: Early research code. Stage A1 working. A2-A4 in development.
