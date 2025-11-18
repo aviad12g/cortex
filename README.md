@@ -1,132 +1,227 @@
-# Cortex: Biologically-Inspired Gated Delta Memory
+# Cortex: Biologically-Inspired Gated Delta Memory for Infinite Context LLMs
 
-Cortex augments frozen Large Language Models with a trainable, biologically-plausible memory system. It enables **infinite context windows** and **persistent memory** across sessions without modifying the base model's weights.
+**Abstract**
 
-By attaching a lightweight **Gated DeltaNet** sidecar to every attention layer, Cortex allows the model to "write" to a fast-weight matrix $S$ during inference. This memory is dynamic: it decays, updates based on prediction error (surprise), and consolidates important information during "sleep" phases.
+Cortex is a neural architecture that augments pre-trained Large Language Models (LLMs) with a dynamic, biologically-plausible memory system. By attaching lightweight **Gated DeltaNet** sidecars to frozen attention layers, Cortex enables **infinite context windows** and **cross-session persistence** with constant memory complexity $O(1)$ during inference. Unlike standard recurrence, Cortex employs a Gated Delta Rule with metacognitive plasticity, allowing the model to selectively forget, update, and consolidate information based on real-time entropy and prediction error signals.
 
-## Core Architecture
+---
 
-### 1. The Gated DeltaNet Sidecar
-Instead of standard attention ($O(N^2)$), Cortex uses a linear recurrent formulation ($O(N)$) based on the **Gated Delta Rule**. This allows it to maintain a fixed-size state $S$ regardless of sequence length.
+## 1. Introduction
 
-**Mathematical Formulation:**
+Standard Transformer models scale quadratically $O(N^2)$ with sequence length, fundamentally limiting their ability to process infinite streams of data. While techniques like RAG (Retrieval Augmented Generation) provide a workaround, they lack the ability to synthesize information into a coherent evolving latent state.
 
-Let $x_t$ be the input at step $t$. We project it to queries, keys, and values:
-$$q_t, k_t, v_t = \text{Proj}(x_t)$$
+Cortex addresses this by introducing a **Fast-Weight Memory System** ($S$) that evolves parallel to the frozen "Slow-Weight" parameters ($W$) of a base model (e.g., Qwen, Llama). This dual-system approach mimics the interaction between the hippocampus (fast, volatile memory) and the neocortex (slow, consolidated knowledge).
 
-To capture local context before long-term storage, we apply a short depthwise convolution:
-$$q'_t, k'_t, v'_t = \text{ShortConv1d}(q_t, k_t, v_t)$$
+## 2. Mathematical Framework
 
-The memory state $S_t \in \mathbb{R}^{d \times d}$ is updated using a forgetting gate $\alpha_t$ and a writing gate $\beta_t$:
+The core of Cortex is the **Gated DeltaNet**, a linear recurrent unit that updates a state matrix $S_t \in \mathbb{R}^{d \times d}$ based on the error between prediction and reality.
 
-$$ \text{Recall:} \quad v_{\text{old}} = S_{t-1} k'_t $$
-$$ \text{Update:} \quad S_t = \alpha_t S_{t-1} + \beta_t (v'_t - \alpha_t v_{\text{old}}) {k'_t}^T $$
-$$ \text{Read:} \quad y_t = S_t q'_t $$
+### 2.1. The Gated Delta Rule
 
-*   **$\alpha_t$ (Forget Gate):** Controls how much of the old memory is retained.
-*   **$\beta_t$ (Input Gate):** Controls how strongly new information is written.
-*   **Delta Rule $(v - S k)$:** We only learn the *error*—the difference between the retrieved value and the new value. This prevents capacity saturation compared to standard Hebbian learning.
+Standard linear attention (Hebbian learning) suffers from capacity saturation. Cortex utilizes the Delta Rule, which updates the memory based on the *residual* (error) rather than the raw signal.
 
-### 2. Metacognitive Plasticity
-The model learns *how to learn*. A specialized **Controller** network monitors the base model's internal state to modulate the plasticity gates $\alpha$ and $\beta$.
+Given input features $k_t, v_t \in \mathbb{R}^d$ at step $t$:
 
-*   **Entropy (Uncertainty):** If the model is unsure (high entropy), it may open the gates to absorb new information.
-*   **Surprise (Loss):** High prediction error signals a need to update the memory model to correct the mistake.
+1.  **Recall**: Retrieve the current estimate from memory.
+    $$v_{\text{est}} = S_{t-1} k_t$$
 
-$$ [\alpha_t, \beta_t] = \text{Controller}(\text{Entropy}(p_t), \text{Surprise}(y_t), \text{HiddenState}_t) $$
+2.  **Residual Calculation**: Determine the discrepancy between the input value and the memory's estimate.
+    $$\delta_t = v_t - \alpha_t v_{\text{est}}$$
 
-### 3. System Overview
+3.  **State Update**: Update the state matrix using the outer product of the residual and the key.
+    $$S_t = \alpha_t S_{t-1} + \beta_t (\delta_t \otimes k_t^T)$$
+
+Where:
+*   $\alpha_t \in [0, 1]$ is the **Forget Gate** (how much history to retain).
+*   $\beta_t \in \mathbb{R}^+$ is the **Write Gate** (learning rate intensity).
+
+### 2.2. Inference Dynamics
+
+The inference pass is efficient and recurrent:
+
+$$y_t = \text{Linear}(S_t q_t)$$
+
+This operation is $O(d^2)$ per step, independent of sequence length $N$.
+
+## 3. System Architecture
+
+Cortex wraps a frozen base model, intercepting hidden states to inject memory dynamics.
+
+### 3.1. Component Diagram
 
 ```mermaid
 graph TD
-    subgraph Frozen Base Model
-        H[Hidden State] --> Attn[Self Attention]
-        H --> FFN[Feed Forward]
+    subgraph "Frozen Base Model (Neocortex)"
+        L[Layer N Input] --> Attn[Multi-Head Attention]
+        L --> FFN[Feed-Forward Network]
     end
 
-    subgraph Cortex Sidecar
-        H --> Proj[Q, K, V Projections]
-        Proj --> Conv[Short Conv1d]
-        Conv --> Norm[L2 Norm on K]
+    subgraph "Cortex Sidecar (Hippocampus)"
+        L --> P[Projections Q,K,V]
+        P --> SC[ShortConv1d]
+        SC --> GN[Gated DeltaNet]
         
-        Norm --> Read[Read Memory]
-        S[State Matrix S] -.-> Read
-        Read --> Out[y_t = S * q]
+        subgraph "Metacognitive Controller"
+            M1[Entropy H(p)] --> C[Controller MLP]
+            M2[Surprise -log(p)] --> C
+            C -->|Gates α, β| GN
+        end
         
-        Norm --> Update[Update Memory]
-        Control[Controller] -->|alpha, beta| Update
-        Update -->|Delta Rule| S
+        GN -->|State S| MEM[Persistent Memory]
+        MEM -->|S| GN
+        GN --> OUT[Memory Output]
     end
 
-    H --> Control
-    Attn --> Add[+]
-    Out --> Add
-    Add --> FFN
+    Attn --> ADD(+)
+    OUT --> ADD
+    ADD --> FFN
+    FFN --> L_NEXT[Layer N+1]
 ```
 
-## Key Features
+### 3.2. Information Flow: Training vs. Inference
 
-*   **Infinite Context:** Memory cost is constant $O(1)$ regardless of sequence length.
-*   **Frozen Base:** The large base model (e.g., Qwen-0.5B, Llama-3) remains untouched. Only the lightweight Cortex parameters (~2% of base) are trained.
-*   **Sleep & Consolidation:** A periodic "sleep" phase generates random noise and uses **Fisher Information Matrix (FIM)** regularization to consolidate short-term fast weights into long-term slow weights, preventing catastrophic forgetting.
-*   **Truncated BPTT:** Supports training on sequences far exceeding GPU memory by detaching gradients between chunks while persisting the memory state $S$.
+```mermaid
+sequenceDiagram
+    participant User
+    participant Tokenizer
+    participant Cortex
+    participant MemoryState
+    participant SleepConsolidator
 
-## Installation
+    Note over Cortex, MemoryState: Continuous Learning Flow
+    User->>Cortex: Input Stream (Infinite)
+    Cortex->>MemoryState: Retrieve State S_{t-1}
+    Cortex->>Cortex: Compute Prediction Error (Surprise)
+    Cortex->>MemoryState: Update State S_t (Delta Rule)
+    Cortex->>User: Next Token Prediction
+    
+    Note over Cortex, SleepConsolidator: Periodic Consolidation
+    loop Every N Steps
+        Cortex->>SleepConsolidator: Initiate Sleep Phase
+        SleepConsolidator->>MemoryState: Analyze Fisher Information
+        SleepConsolidator->>MemoryState: Consolidate & Prune
+    end
+```
 
+### 3.3. Architectural Innovations
+
+1.  **Short Convolution**: A depthwise `Conv1d` (kernel size 3) processes $q, k, v$ before they enter the recurrent state. This captures local n-gram dependencies that linear RNNs typically miss.
+2.  **L2 Normalization**: Keys $k_t$ are L2-normalized, ensuring the eigenvalues of the recurrent matrix remain stable, preventing the "exploding gradient" problem common in RNNs.
+3.  **Metacognitive Plasticity**: A lightweight controller monitors the base model's **Entropy** (uncertainty) and **Surprise** (loss).
+    *   *High Surprise*: Increases $\beta$ (write rate) to correct the error.
+    *   *High Entropy*: Modulates $\alpha$ to stabilize memory during confusing segments.
+
+### 3.4. Metacognitive Gating Visualization
+
+```mermaid
+graph LR
+    Input[Input Token] --> Model[Base Model]
+    Model --> Logits[Logits]
+    Logits --> Entropy[Entropy Calc]
+    Logits --> Surprise[Surprise Calc]
+    
+    Entropy --> Controller[Controller MLP]
+    Surprise --> Controller
+    
+    Controller --> Alpha[Alpha (Forget)]
+    Controller --> Beta[Beta (Write)]
+    
+    Alpha --> Memory[Memory Update]
+    Beta --> Memory
+```
+
+## 4. Training Methodology
+
+Cortex employs a multi-stage training regime designed for infinite context.
+
+### 4.1. Truncated Backpropagation Through Time (TBPTT)
+We train on sequences of unlimited length by splitting them into chunks (e.g., 512 tokens).
+*   **Forward**: Gradients are computed within the chunk.
+*   **State Persistence**: The final state $S_T$ of chunk $i$ becomes the initial state $S_0$ of chunk $i+1$.
+*   **Backward**: Gradients are detached between chunks to bound memory usage, while the forward pass propagates information indefinitely.
+
+### 4.2. Sleep & Consolidation
+To prevent catastrophic forgetting of long-term data, Cortex enters a "Sleep Phase" every $N$ steps.
+1.  **Dreaming**: The model generates noise or replays buffered tokens.
+2.  **Fisher Information**: We calculate the Fisher Information Matrix (FIM) to identify critical weights in $S$.
+3.  **Consolidation**: A regularization term penalizes changes to these critical weights during subsequent training, effectively "solidifying" memories.
+
+## 5. Complexity Analysis
+
+Comparison between Standard Attention (Transformer) and Cortex (Gated DeltaNet).
+
+| Metric | Standard Attention | Cortex Memory |
+| :--- | :--- | :--- |
+| **Training Compute** | $O(N^2)$ | $O(N)$ |
+| **Inference Memory** | $O(N)$ (KV Cache) | $O(1)$ (Fixed State $S$) |
+| **Inference Latency** | $O(N)$ (Prefill) | $O(1)$ (Step) |
+| **Context Length** | Finite (Window Size) | Infinite (Recurrent) |
+
+## 6. Installation & Usage
+
+### Prerequisites
 ```bash
 pip install torch transformers accelerate
 ```
 
-## Usage
-
-### Training (Infinite Context Mode)
-Train the Cortex sidecars on long sequences with memory persistence and sleep phases.
-
-```bash
-python scripts/stage_a1_enable_fast.py \
-    --model Qwen/Qwen2.5-0.5B-Instruct \
-    --task kv \
-    --chunk_size 512 \
-    --gaps 2000 4000 \
-    --samples_per_gap 256 \
-    --fast_rank 64 \
-    --lr_sidecar 5e-5
-```
-
-### Inference
+### Integration
+Cortex wraps any Hugging Face model non-intrusively.
 
 ```python
+import torch
 from base.hf_wrap import load_qwen_with_cortex, CortexWrapConfig
 
-# Load with Gated DeltaNet configuration
+# 1. Configure the Gated DeltaNet Sidecar
 config = CortexWrapConfig(
-    rank_fast=64,
-    alpha_max=0.99,
-    use_short_conv=True
+    rank_fast=64,          # Dimension of memory state
+    alpha_max=0.99,        # Maximum forget gate value
+    use_short_conv=True,   # Enable local context convolution
+    meta_plasticity=True   # Enable entropy-based gating
 )
 
+# 2. Load Base Model (Frozen) + Cortex (Trainable)
 model = load_qwen_with_cortex("Qwen/Qwen2.5-0.5B-Instruct", cortex_cfg=config)
 
-# Chat with persistent memory
-history = []
-session_id = "user_session_1"
-
-response = model.generate(
+# 3. Inference with Persistent Session
+# The session_id ensures 'S' is preserved between calls
+output = model.generate(
     input_ids, 
-    session_id=session_id, # Persists memory state S across calls
+    session_id="user_session_123",
     reset_session=False
 )
 ```
 
-## Implementation Details
+## 7. Repository Structure
 
-| Component | Specification |
-|-----------|---------------|
-| **State Shape** | $[B, H, D_{head}, D_{head}]$ |
-| **Update Rule** | Gated Delta Rule (Linear Transformer) |
-| **Local Context** | Depthwise Conv1d (kernel=3) |
-| **Normalization** | L2 Norm on Keys (crucial for stability) |
-| **Gating** | Data-dependent $\alpha, \beta$ (Sigmoid) |
+```text
+cortex/
+├── base/
+│   └── hf_wrap.py          # HuggingFace Wrapper & Sidecar Injection
+├── blocks/
+│   ├── cortex_block.py     # Gated DeltaNet Implementation
+│   └── controller.py       # Metacognitive Controller (Entropy/Surprise)
+├── mem/
+│   ├── session.py          # Session State Management
+│   ├── consolidation.py    # Sleep & Fisher Information Logic
+│   └── fast_weights.py     # Fast Weight Utilities
+└── scripts/
+    └── stage_a1_enable_fast.py  # Infinite Context Training Loop
+```
 
-## License
-MIT
+## 8. Citation
+
+If you use Cortex in your research, please cite:
+
+```bibtex
+@misc{cortex2025,
+  author = {Cortex Team},
+  title = {Cortex: Biologically-Inspired Gated Delta Memory for Infinite Context LLMs},
+  year = {2025},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/aviad12g/cortex}}
+}
+```
+
+---
+*Built for the next generation of reasoning engines.*
