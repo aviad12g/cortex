@@ -8,6 +8,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM
 
 from blocks.cortex_block import CortexBlock, CortexBlockConfig
+from blocks.hybrid_cortex import HybridCortexBlock
 from blocks.controller import ControllerConfig, CortexController
 from mem.fast_weights import allocate_fast_buffers
 from mem.session import SessionState
@@ -26,7 +27,10 @@ class CortexWrapConfig:
     beta: float = 0.01
     code_size: int = 128
     sleep_interval: int = 512
+    sleep_interval: int = 512
     sleep_steps: int = 8
+    use_hybrid: bool = True
+    window_size: int = 128
 
 
 class CortexWrappedModel(nn.Module):
@@ -36,7 +40,9 @@ class CortexWrappedModel(nn.Module):
         super().__init__()
         self.base = base
         self.config = config
-        self.controller = CortexController(ControllerConfig(d_model=base.config.hidden_size))
+        self.controller = CortexController(
+            ControllerConfig(d_model=base.config.hidden_size)
+        )
         self._cortex_layers: Sequence[nn.Module] = ()
         self.sessions: Dict[str, SessionState] = {}
         self._active_session: Optional[SessionState] = None
@@ -65,7 +71,9 @@ class CortexWrappedModel(nn.Module):
         else:
             self._active_session = None
 
-        batch_size, seq_len, device = self._extract_batch_seq_device(*args, **kwargs)
+        batch_size, seq_len, device = self._extract_batch_seq_device(
+            *args, **kwargs
+        )
         self.gate_logs.clear()
         self._controller_inputs_cache = None
         self._last_gates = None
@@ -81,13 +89,17 @@ class CortexWrappedModel(nn.Module):
                 probs = torch.softmax(logits_det, dim=-1)
                 log_probs = torch.log_softmax(logits_det, dim=-1)
                 # Entropy = -sum(p * log_p)
-                entropy = -(probs * log_probs).sum(dim=-1).mean().item()
-                
+                entropy = (
+                    -(probs * log_probs).sum(dim=-1).mean().item()
+                )
+
                 loss_val = None
                 if hasattr(outputs, "loss") and outputs.loss is not None:
                     loss_val = outputs.loss.item()
-                    
-                session_state.update_metrics(surprise=loss_val, uncertainty=entropy)
+
+                session_state.update_metrics(
+                    surprise=loss_val, uncertainty=entropy
+                )
 
             self._persist_fast_buffers(session_state)
             session_state.advance(seq_len)
@@ -96,8 +108,17 @@ class CortexWrappedModel(nn.Module):
         self._gate_cache = None
         return outputs
 
-    def reset_cortex_state(self, batch_size: int, device: Optional[torch.device] = None) -> None:
-        allocate_fast_buffers(self.base, batch_size, device or next(self.parameters()).device)
+    def reset_cortex_state(
+        self, batch_size: int, device: Optional[torch.device] = None
+    ) -> None:
+        allocate_fast_buffers(
+            self.base, batch_size, device or next(self.parameters()).device
+        )
+
+    def flush_sessions(self) -> None:
+        """Clear all stored session states to prevent memory leaks."""
+        self.sessions.clear()
+        self._active_session = None
 
     def cortex_parameters(self) -> Iterable[nn.Parameter]:
         # return only Cortex params (not base model)
@@ -121,7 +142,9 @@ class CortexWrappedModel(nn.Module):
     def enable_sidecar(self, enabled: bool) -> None:
         self._sidecar_enabled = enabled
 
-    def _extract_batch_seq_device(self, *args, **kwargs) -> Tuple[int, int, torch.device]:
+    def _extract_batch_seq_device(
+        self, *args, **kwargs
+    ) -> Tuple[int, int, torch.device]:
         tensor = None
         if "input_ids" in kwargs and kwargs["input_ids"] is not None:
             tensor = kwargs["input_ids"]
@@ -132,7 +155,9 @@ class CortexWrappedModel(nn.Module):
         if tensor is None and kwargs.get("inputs_embeds") is not None:
             tensor = kwargs["inputs_embeds"]
         if tensor is None:
-            raise ValueError("CortexWrappedModel requires input_ids or inputs_embeds.")
+            raise ValueError(
+                "CortexWrappedModel requires input_ids or inputs_embeds."
+            )
 
         if tensor.dim() == 3:
             batch_size, seq_len = tensor.shape[0], tensor.shape[1]
@@ -140,16 +165,32 @@ class CortexWrappedModel(nn.Module):
             batch_size, seq_len = tensor.shape[0], tensor.shape[1]
         return batch_size, seq_len, tensor.device
 
-    def _prepare_gates(self, batch_size: int, seq_len: int, device: torch.device) -> None:
+    def _prepare_gates(
+        self, batch_size: int, seq_len: int, device: torch.device
+    ) -> None:
         if seq_len == 0:
-            m_gate = torch.zeros(batch_size, 0, device=device, dtype=self._default_dtype)
-            alpha_scale = torch.zeros(batch_size, 0, self.base.config.num_attention_heads, device=device, dtype=self._default_dtype)
+            m_gate = torch.zeros(
+                batch_size, 0, device=device, dtype=self._default_dtype
+            )
+            alpha_scale = torch.zeros(
+                batch_size,
+                0,
+                self.base.config.num_attention_heads,
+                device=device,
+                dtype=self._default_dtype,
+            )
             self._gate_cache = (m_gate, alpha_scale)
             return
 
         session = self._active_session
         if session is None:
-            base = torch.zeros(batch_size, seq_len, 1, device=device, dtype=self._default_dtype)
+            base = torch.zeros(
+                batch_size,
+                seq_len,
+                1,
+                device=device,
+                dtype=self._default_dtype,
+            )
             controller_inputs = {
                 "surprise": base,
                 "uncertainty": base,
@@ -157,25 +198,49 @@ class CortexWrappedModel(nn.Module):
                 "phase": base,
             }
         else:
-            controller_inputs = session.controller_inputs(batch_size, seq_len, device)
+            controller_inputs = session.controller_inputs(
+                batch_size, seq_len, device
+            )
 
-        flattened = {key: value.view(-1, 1) for key, value in controller_inputs.items()}
+        flattened = {
+            key: value.view(-1, 1) for key, value in controller_inputs.items()
+        }
         controller_out = self.controller(flattened)
-        m_gate = controller_out["m_gate"].view(batch_size, seq_len).to(device=device, dtype=self._default_dtype)
-        write_scale = controller_out["write_scale"].view(batch_size, seq_len, 1).to(device=device, dtype=self._default_dtype)
-        alpha_scale = write_scale.expand(-1, -1, self.base.config.num_attention_heads)
+        m_gate = (
+            controller_out["m_gate"]
+            .view(batch_size, seq_len)
+            .to(device=device, dtype=self._default_dtype)
+        )
+        write_scale = (
+            controller_out["write_scale"]
+            .view(batch_size, seq_len, 1)
+            .to(device=device, dtype=self._default_dtype)
+        )
+        alpha_scale = write_scale.expand(
+            -1, -1, self.base.config.num_attention_heads
+        )
         self._gate_cache = (m_gate, alpha_scale)
         self._controller_inputs_cache = controller_inputs
 
-    def _fetch_gates(self, batch_size: int, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self._gate_cache is None or self._gate_cache[0].shape[1] != seq_len:
+    def _fetch_gates(
+        self, batch_size: int, seq_len: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self._gate_cache is None
+            or self._gate_cache[0].shape[1] != seq_len
+        ):
             self._prepare_gates(batch_size, seq_len, device)
         m_gate, alpha_scale = self._gate_cache
         m_gate_t = m_gate.to(device)
         alpha_scale_t = alpha_scale.to(device)
         if self._alpha_override is not None:
-            alpha_scale_t = torch.full_like(alpha_scale_t, self._alpha_override)
-        self._last_gates = (m_gate_t.detach().cpu(), alpha_scale_t.detach().cpu())
+            alpha_scale_t = torch.full_like(
+                alpha_scale_t, self._alpha_override
+            )
+        self._last_gates = (
+            m_gate_t.detach().cpu(),
+            alpha_scale_t.detach().cpu(),
+        )
         return m_gate_t, alpha_scale_t
 
     def _persist_fast_buffers(self, session: SessionState) -> None:
@@ -183,10 +248,20 @@ class CortexWrappedModel(nn.Module):
             # S is the only state now
             session.store_fast_buffer(idx, layer.S, layer.S)
 
-    def _log_gate_stats(self, layer_idx: int, m_gate: torch.Tensor, alpha_scale: torch.Tensor) -> None:
+    def _log_gate_stats(
+        self, layer_idx: int, m_gate: torch.Tensor, alpha_scale: torch.Tensor
+    ) -> None:
         controller_inputs = getattr(self, "_controller_inputs_cache", None)
-        surprise_mean = float(controller_inputs["surprise"].mean().item()) if controller_inputs else 0.0
-        uncertainty_mean = float(controller_inputs["uncertainty"].mean().item()) if controller_inputs else 0.0
+        surprise_mean = (
+            float(controller_inputs["surprise"].mean().item())
+            if controller_inputs
+            else 0.0
+        )
+        uncertainty_mean = (
+            float(controller_inputs["uncertainty"].mean().item())
+            if controller_inputs
+            else 0.0
+        )
         self.gate_logs.append(
             {
                 "layer": layer_idx,
@@ -195,9 +270,18 @@ class CortexWrappedModel(nn.Module):
                 "alpha_mean": float(alpha_scale.mean().item()),
                 "alpha_max": float(alpha_scale.max().item()),
                 "m_mean_batch": m_gate.mean(dim=1).detach().cpu().tolist(),
-                "m_max_batch": m_gate.max(dim=1).values.detach().cpu().tolist(),
-                "alpha_mean_batch": alpha_scale.mean(dim=1).detach().cpu().tolist(),
-                "alpha_max_batch": alpha_scale.max(dim=1).values.detach().cpu().tolist(),
+                "m_max_batch": m_gate.max(dim=1)
+                .values.detach()
+                .cpu()
+                .tolist(),
+                "alpha_mean_batch": alpha_scale.mean(dim=1)
+                .detach()
+                .cpu()
+                .tolist(),
+                "alpha_max_batch": alpha_scale.max(dim=1)
+                .values.detach()
+                .cpu()
+                .tolist(),
                 "surprise_mean": surprise_mean,
                 "uncertainty_mean": uncertainty_mean,
             }
@@ -213,7 +297,11 @@ def load_qwen_with_cortex(
 ) -> CortexWrappedModel:
     cortex_cfg = cortex_cfg or CortexWrapConfig()
     base = AutoModelForCausalLM.from_pretrained(
-        model_name, device_map=device_map, torch_dtype=torch_dtype, trust_remote_code=True, **from_pretrained_kwargs
+        model_name,
+        device_map=device_map,
+        torch_dtype=torch_dtype,
+        trust_remote_code=True,
+        **from_pretrained_kwargs,
     )
     wrapped = CortexWrappedModel(base, cortex_cfg)
     attach_cortex_sidecars(wrapped)
@@ -237,19 +325,30 @@ def attach_cortex_sidecars(wrapper: CortexWrappedModel) -> None:
     cortex_layers = []
     for idx, layer in enumerate(layers):
         if not isinstance(layer, Qwen2DecoderLayer):
-            raise TypeError(f"Layer {idx} is {type(layer)}; only Qwen2DecoderLayer supported for now.")
-        cortex_block = CortexBlock(
-            CortexBlockConfig(
-                d_model=cfg.hidden_size,
-                n_heads=cfg.num_attention_heads,
-                d_head=wrapper.config.rank_fast,
+            raise TypeError(
+                f"Layer {idx} is {type(layer)}; only Qwen2DecoderLayer supported for now."
             )
-        )
-        cortex_block.tie_projections(layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj, layer.self_attn.o_proj)
+        if wrapper.config.use_hybrid:
+            cortex_block = HybridCortexBlock(
+                dim=cfg.hidden_size,
+                head_dim=wrapper.config.rank_fast,
+                window_size=wrapper.config.window_size,
+            )
+            # Hybrid block doesn't support tie_projections yet or needs different handling
+        else:
+            cortex_block.tie_projections(
+                layer.self_attn.q_proj,
+                layer.self_attn.k_proj,
+                layer.self_attn.v_proj,
+                layer.self_attn.o_proj,
+            )
+
         layer.cortex_block = cortex_block
         layer.register_forward_pre_hook(_make_restore_hook(wrapper, idx))
         bound_forward = _bind_cortex_forward(wrapper, cortex_block, idx)
-        layer.forward = bound_forward.__get__(layer, layer.__class__)  # type: ignore[assignment]
+        layer.forward = bound_forward.__get__(
+            layer, layer.__class__
+        )  # type: ignore[assignment]
         cortex_layers.append(cortex_block)
 
     wrapper._cortex_layers = tuple(cortex_layers)
@@ -257,17 +356,17 @@ def attach_cortex_sidecars(wrapper: CortexWrappedModel) -> None:
     # Monkey-patch the final norm to handle potential tuple propagation issues
     if hasattr(wrapper.base.model, "norm"):
         old_norm = wrapper.base.model.norm
-        
+
         class SafeNorm(nn.Module):
             def __init__(self, original_norm):
                 super().__init__()
                 self.original_norm = original_norm
-            
+
             def forward(self, hidden_states):
                 while isinstance(hidden_states, (tuple, list)):
                     hidden_states = hidden_states[0]
                 return self.original_norm(hidden_states)
-                
+
         wrapper.base.model.norm = SafeNorm(old_norm)
 
 
@@ -278,7 +377,7 @@ def _make_restore_hook(wrapper: CortexWrappedModel, layer_idx: int):
         hidden_states = inputs
         while isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
-        
+
         batch = hidden_states.shape[0]
         device = hidden_states.device
         cortex_block: CortexBlock = module.cortex_block
@@ -288,9 +387,20 @@ def _make_restore_hook(wrapper: CortexWrappedModel, layer_idx: int):
             return
         snapshot = session.get_fast_buffer(layer_idx)
         if snapshot is None or snapshot.U.shape[0] != batch:
-            cortex_block.reset_fast(batch, device=device)
+            cortex_block.reset_fast(
+                batch, device=device
+            ) if hasattr(cortex_block, "reset_fast") else None
+            # For HybridBlock, we might need to manually reset S if it's not a buffer
+            if isinstance(cortex_block, HybridCortexBlock):
+                cortex_block.S = None  # Will be re-init in forward
             return
-        cortex_block.load_fast(snapshot.U.to(device), snapshot.V.to(device))
+
+        if hasattr(cortex_block, "load_fast"):
+            cortex_block.load_fast(
+                snapshot.U.to(device), snapshot.V.to(device)
+            )
+        elif isinstance(cortex_block, HybridCortexBlock):
+            cortex_block.S = snapshot.U.to(device)
 
     return hook
 
@@ -307,37 +417,56 @@ def _bind_cortex_forward(
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Any] = None,
+        output_attentions: Optional[bool] = False,  # Added for compatibility with gradient checkpointing
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings: Optional[
+            tuple[torch.Tensor, torch.Tensor]
+        ] = None,
         **kwargs,
     ):
-        # Debug Logging
-        with open("debug_cortex.log", "a") as f:
-             f.write(f"Layer {layer_idx} Input Type: {type(hidden_states)}\n")
-             
+
         # Unwrap if hidden_states is passed as tuple
         while isinstance(hidden_states, (tuple, list)):
             hidden_states = hidden_states[0]
-            
+
         residual = hidden_states
         normed = self.input_layernorm(hidden_states)
         batch_size, seq_len = normed.size(0), normed.size(1)
-        m_gate, alpha_scale = wrapper._fetch_gates(batch_size, seq_len, normed.device)
+        m_gate, alpha_scale = wrapper._fetch_gates(
+            batch_size, seq_len, normed.device
+        )
 
         attn_outputs = self.self_attn(
             hidden_states=normed,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
+            output_attentions=output_attentions,  # Pass it through
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )
         attn_output = attn_outputs[0]
-        mix_mode = wrapper._mix_mode if wrapper._sidecar_enabled else "slow_only"
-        cortex_delta = cortex_block(normed, m_gate, alpha_scale, mix_mode=mix_mode)
+        mix_mode = (
+            wrapper._mix_mode if wrapper._sidecar_enabled else "slow_only"
+        )
+
+        if isinstance(cortex_block, HybridCortexBlock):
+            # Hybrid block returns (output, state, surprise)
+            # We need to handle the state update and surprise logging
+            # For now, we just use the output
+            cortex_delta, next_state, surprise = cortex_block(
+                normed, getattr(cortex_block, "S", None)
+            )
+            cortex_block.S = next_state  # Update state
+            # Log surprise if needed
+        else:
+            cortex_delta = cortex_block(
+                normed, m_gate, alpha_scale, mix_mode=mix_mode
+            )
+
         wrapper._log_gate_stats(layer_idx, m_gate, alpha_scale)
         if wrapper._sidecar_enabled:
             hidden_states = residual + attn_output + cortex_delta
@@ -348,36 +477,36 @@ def _bind_cortex_forward(
         hidden_states = self.post_attention_layernorm(hidden_states)
         mlp_out = self.mlp(hidden_states)
         hidden_states = residual + mlp_out
-        
-        # Ensure hidden_states is a tensor
+
         if isinstance(hidden_states, (tuple, list)):
-             print(f"DEBUG: Unwrapping hidden_states from {type(hidden_states)}", file=sys.stderr)
-             while isinstance(hidden_states, (tuple, list)):
-                 hidden_states = hidden_states[0]
+            # print(f"DEBUG: Unwrapping hidden_states from {type(hidden_states)}", file=sys.stderr)
+            while isinstance(hidden_states, (tuple, list)):
+                hidden_states = hidden_states[0]
 
         if not isinstance(hidden_states, torch.Tensor):
-            print(f"CRITICAL: hidden_states ended up as {type(hidden_states)}", file=sys.stderr)
+            # print(f"CRITICAL: hidden_states ended up as {type(hidden_states)}", file=sys.stderr)
             # Emergency fallback if somehow we got a non-tensor
-            if hasattr(hidden_states, 'tensor'): 
+            if hasattr(hidden_states, "tensor"):
                 hidden_states = hidden_states.tensor
-        
+
         # Build outputs tuple matching what Qwen2Model expects
-        # Qwen2 expectations: (hidden_states, present_key_value, all_hidden_states, all_self_attns)
-        
+        # Qwen2 expectations: (
+        #     hidden_states,
+        #     present_key_value,
+        #     all_hidden_states,
+        #     all_self_attns,
+        # )
+
         # 1. Hidden States (Tensor)
         outputs = (hidden_states,)
-        
+
         # 2. Present Key Value (Cache) - from attn_outputs[1]
         if len(attn_outputs) > 1:
             outputs += (attn_outputs[1],)
-        
+
         # 3. Attentions - from attn_outputs[2]
         if len(attn_outputs) > 2:
             outputs += (attn_outputs[2],)
-
-        with open("debug_cortex.log", "a") as f:
-             f.write(f"Layer {layer_idx} Output Type: {type(outputs)} of len {len(outputs)}\n")
-             f.write(f"Layer {layer_idx} Output[0] Type: {type(outputs[0])}\n")
 
         return outputs
 

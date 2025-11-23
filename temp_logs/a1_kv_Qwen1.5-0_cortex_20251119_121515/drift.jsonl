@@ -1,0 +1,1 @@
+{"run_id": "a1_kv_Qwen1.5-0_cortex_20251119_121515", "variant": "cortex", "epoch": 1, "seed": 42, "ppl_probe": 60229318.57542, "ppl_delta_pct": 0.0, "hidden_kl": 0.0}

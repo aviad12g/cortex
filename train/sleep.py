@@ -1,3 +1,5 @@
+import torch
+from torch.amp import autocast
 
 def run_sleep_phase(model, consolidator, tokenizer, device, batch_size=4):
     """
@@ -7,32 +9,57 @@ def run_sleep_phase(model, consolidator, tokenizer, device, batch_size=4):
     3. Calculate Fisher Information Matrix (FIM) to protect old tasks.
     4. Update weights with consolidation penalty.
     """
-    print("\n[Sleep Phase] Initiating Memory Consolidation...")
+    # print("\n[Sleep Phase] Initiating Memory Consolidation...")
     model.train()
     
     # 1. Generate Dream Data (White Noise / Static)
-    # In a real system, this would be a buffer of past successful interactions.
-    # Here we use random tokens to simulate 'unlearning' or 'stabilizing' chaos.
     dream_inputs = torch.randint(0, tokenizer.vocab_size, (batch_size, 64)).to(device)
     dream_labels = dream_inputs.clone()
     
-    # 2. Fisher Calculation (simplified)
-    # We take a few steps on the dream data to see what neurons are active
-    # and protect them.
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-5) # Low LR for sleep
+    # 2. Optimization Setup
+    # Use model.cortex_parameters() if available to ensure we get the right params
+    if hasattr(model, "cortex_parameters"):
+        cortex_params = list(model.cortex_parameters())
+    else:
+        # Fallback (e.g. if model is wrapped in DDP and we didn't unwrap, though we should)
+        cortex_params = [p for n, p in model.named_parameters() if "cortex" in n and p.requires_grad]
+
+    optimizer = torch.optim.AdamW(cortex_params, lr=1e-4)
     
-    for i in range(5): # Short REM cycle
+    # Handle GradScaler deprecation
+    try:
+        from torch.amp import GradScaler
+        scaler = GradScaler('cuda', enabled=True)
+    except ImportError:
+        from torch.cuda.amp import GradScaler
+        scaler = GradScaler(enabled=True)
+    
+    steps = 8 # Match config
+    
+    for i in range(steps): 
         optimizer.zero_grad()
-        outputs = model(dream_inputs, labels=dream_labels)
-        loss = outputs.loss
+        with autocast(device_type=device.type, enabled=True):
+            # Pass session_id=None to avoid polluting active session
+            outputs = model(input_ids=dream_inputs, labels=dream_labels, use_cache=False, session_id=None)
+            loss = outputs.loss
         
-        # Add Fisher Penalty if available
-        # (In this simplified script, we assume the loss itself acts as the stabilizer
-        #  preventing the weights from drifting too far from a valid language manifold)
-        
-        loss.backward()
-        optimizer.step()
-        
-    print("[Sleep Phase] Consolidation Complete. Synaptic weights stabilized.")
+        if torch.isnan(loss):
+            # print(f"[Sleep Phase] Warning: NaN loss detected at step {i+1}. Skipping step.")
+            optimizer.zero_grad()
+            continue
 
-
+        # Backward pass
+        scaler.scale(loss).backward()
+        
+        # Gradient clipping
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(cortex_params, max_norm=1.0)
+        
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+        
+    # Cleanup to prevent OOM / fragmentation
+    del optimizer, scaler, dream_inputs, dream_labels, outputs, loss
+    torch.cuda.empty_cache()
+    # print("[Sleep Phase] Consolidation Complete. Synaptic weights stabilized.")

@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg", type=str, default=None)
     parser.add_argument("--run_id", type=str, default=None)
     parser.add_argument("--samples_per_gap", type=int, default=512)
+    parser.add_argument("--sleep_interval", type=int, default=512)
     parser.add_argument("--chunk_size", type=int, default=0, help="If > 0, split sequences into chunks for TBPTT")
     return parser.parse_args()
 
@@ -133,7 +134,8 @@ def evaluate_probe_perplexity(
         for text in probe_texts:
             encoded = tokenizer(text, return_tensors="pt", truncation=True)
             encoded = {k: v.to(device) for k, v in encoded.items()}
-            outputs = model(**encoded, labels=encoded["input_ids"], session_id="probe", reset_session=True, use_cache=False)
+            with autocast(device_type=device.type, enabled=True):
+                outputs = model(**encoded, labels=encoded["input_ids"], session_id="probe", reset_session=True, use_cache=False)
             losses.append(outputs.loss.item())
     model.train()
 
@@ -177,14 +179,24 @@ def summarize_fast_stats(
 
         if getattr(block, "last_alpha", None) is not None and block.last_alpha.numel() > 0:
             alpha = block.last_alpha
+            # Indexing fix for 4D alpha tensor [B, T, H, 1]
+            if alpha.dim() == 4:
+                # Remove the last dimension (1)
+                alpha = alpha.squeeze(-1) 
             if alpha.dim() == 3:
-                alpha = alpha[0]
+                # Take the first batch item to match answer_idx (which is flat or per-sample)
+                alpha = alpha[0] 
+            
+            # Ensure answer_idx is within bounds
             if answer_idx.numel() > 0:
-                alpha_sel = alpha[answer_idx]
-            else:
-                alpha_sel = alpha
-            if alpha_sel.numel() > 0:
-                alpha_layer_hist.append(alpha_sel.mean(dim=0).tolist())
+                max_idx = answer_idx.max().item()
+                if max_idx < alpha.size(0):
+                    alpha_sel = alpha[answer_idx]
+                    # Move to CPU before converting to list to avoid CUDA sync errors inside list comp
+                    alpha_layer_hist.append(alpha_sel.detach().cpu().mean(dim=0).tolist())
+                else:
+                    # Fallback if indices mismatch
+                    alpha_layer_hist.append([0.0] * alpha.shape[-1])
             else:
                 alpha_layer_hist.append([0.0] * alpha.shape[-1])
         else:
@@ -294,7 +306,27 @@ def main() -> None:
         torch_dtype=dtype,
     )
 
+    # Enable Gradient Checkpointing to save VRAM
+    # We are training sidecars deep in the network, so we need to backprop through the frozen base model.
+    # Without checkpointing, we store all base model activations.
+    model.base.gradient_checkpointing_enable()
+    
+    # CRITICAL: For checkpointing to work with frozen base, inputs must require grad.
+    if hasattr(model.base, "enable_input_require_grads"):
+        model.base.enable_input_require_grads()
+    else:
+        def make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+        model.base.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
     freeze_base_model(model)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    cortex_params_count = sum(p.numel() for p in model.cortex_parameters())
+    print(f"[Stage A1] Total Params: {total_params/1e6:.2f}M")
+    print(f"[Stage A1] Trainable Params: {trainable_params/1e6:.2f}M")
+    print(f"[Stage A1] Cortex Params: {cortex_params_count/1e6:.2f}M")
 
     if args.variant in {"fast_off", "baseline"}:
         model.set_alpha_override(0.0)
@@ -403,7 +435,7 @@ def main() -> None:
                 # Only reset session on the first chunk of the sample
                 should_reset = True if (use_session and is_first) else False
                 
-                with autocast(enabled=amp_enabled and device.type == "cuda"):
+                with autocast(device_type=device.type, enabled=amp_enabled and device.type == "cuda"):
                     outputs = model(
                         input_ids=c_input,
                         labels=c_labels,
@@ -450,11 +482,22 @@ def main() -> None:
                 
             # Sleep / Consolidation Trigger
             # Run sleep phase every 500 global steps
-            if global_step % 500 == 0:
+            if global_step % args.sleep_interval == 0:
                 run_sleep_phase(model, None, tokenizer, device)
                 model.train() # Ensure we return to train mode
+                # model.flush_sessions() # Clearing sessions is handled per-step below now
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             if metrics is None: continue
+
+            # CRITICAL: Memory Leak Fix
+            # Since we use a unique session_id per sample, the session dict grows forever.
+            # We must clear it after processing the sample.
+            if use_session:
+                model.flush_sessions()
 
             probe_entry = {
                 "run_id": run_id,
