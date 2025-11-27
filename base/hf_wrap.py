@@ -27,10 +27,10 @@ class CortexWrapConfig:
     beta: float = 0.01
     code_size: int = 128
     sleep_interval: int = 512
-    sleep_interval: int = 512
     sleep_steps: int = 8
     use_hybrid: bool = True
     window_size: int = 128
+    compression_ratio: int = 4
 
 
 class CortexWrappedModel(nn.Module):
@@ -102,7 +102,7 @@ class CortexWrappedModel(nn.Module):
                 )
 
             self._persist_fast_buffers(session_state)
-            session_state.advance(seq_len)
+            session_state.advance(int(seq_len))
 
         self._active_session = None
         self._gate_cache = None
@@ -333,9 +333,17 @@ def attach_cortex_sidecars(wrapper: CortexWrappedModel) -> None:
                 dim=cfg.hidden_size,
                 head_dim=wrapper.config.rank_fast,
                 window_size=wrapper.config.window_size,
+                compression_ratio=wrapper.config.compression_ratio,
             )
             # Hybrid block doesn't support tie_projections yet or needs different handling
         else:
+            cortex_block = CortexBlock(
+                CortexBlockConfig(
+                    d_model=cfg.hidden_size,
+                    n_heads=wrapper.config.rank_fast, # Using rank_fast as n_heads proxy
+                    d_head=64, # Default
+                )
+            )
             cortex_block.tie_projections(
                 layer.self_attn.q_proj,
                 layer.self_attn.k_proj,
@@ -469,7 +477,15 @@ def _bind_cortex_forward(
 
         wrapper._log_gate_stats(layer_idx, m_gate, alpha_scale)
         if wrapper._sidecar_enabled:
+            if torch.isnan(cortex_delta).any() or torch.isinf(cortex_delta).any():
+                print(f"!!! NAN/INF IN CORTEX_DELTA at Layer {layer_idx} !!!")
+                print(f"Delta Min: {cortex_delta.min()}, Max: {cortex_delta.max()}, Mean: {cortex_delta.mean()}")
+                import sys; sys.exit(1)
             hidden_states = residual + attn_output + cortex_delta
+            if torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any():
+                print(f"!!! NAN/INF IN HIDDEN_STATES (residual+attn+delta) at Layer {layer_idx} !!!")
+                print(f"Hidden Min: {hidden_states.min()}, Max: {hidden_states.max()}, Mean: {hidden_states.mean()}")
+                import sys; sys.exit(1)
         else:
             hidden_states = residual + attn_output
 

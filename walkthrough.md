@@ -45,7 +45,17 @@ Resolve `NaN` loss issues occurring after the Sleep (Memory Consolidation) phase
     *   `m_gate_mean`: Shows `NaN` in logs (benign logging artifact; global controller is unused by `HybridCortexBlock`).
 *   **Sleep Config**: Interval reverted to 512 steps (default). Note: With 256 total steps per epoch, sleep may not trigger in this specific 1-epoch run, but the mechanism is verified.
 
+### Cloud Deployment (Infinite Proof - Gap 35k)
+*   **Status**: **RUNNING** (as of 2025-11-26)
+*   **Infrastructure**: 6x RTX 5090 (RunPod)
+*   **Issue Resolved**: `NaN` loss at Step 1.
+    *   **Root Cause**: The dataset chunking strategy produced chunks containing *only* noise tokens (for the 35k gap). These chunks had no valid labels (all `-100`), causing `CrossEntropyLoss` to return `NaN`.
+    *   **Fix**: Modified `scripts/stage_a1_ddp.py` to explicitly check for empty label sets in a chunk. If found, `loss` is set to `0.0` (allowing state update without gradient error).
+*   **Current Metrics**:
+    *   Loss started at ~12.0 and is fluctuating between 4.0 and 9.0 (normal for early training).
+    *   Model is processing the 35k token gap without crashing.
+
 ## Next Steps
-1.  Monitor the full training run to completion.
+1.  Monitor the cloud run for convergence (Target Loss < 1.06).
 2.  Inspect `drift.jsonl` after the run to verify performance on the KV task.
 3.  If longer training is desired to utilize Sleep Phase, increase `--epochs` or reduce `--sleep_interval`.

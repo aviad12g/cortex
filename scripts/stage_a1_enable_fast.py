@@ -180,25 +180,27 @@ def summarize_fast_stats(
         if getattr(block, "last_alpha", None) is not None and block.last_alpha.numel() > 0:
             alpha = block.last_alpha
             # Indexing fix for 4D alpha tensor [B, T, H, 1]
-            if alpha.dim() == 4:
-                # Remove the last dimension (1)
-                alpha = alpha.squeeze(-1) 
-            if alpha.dim() == 3:
-                # Take the first batch item to match answer_idx (which is flat or per-sample)
-                alpha = alpha[0] 
+            # Robustly average alpha to [H]
+            # alpha is likely [B, T, H, 1] or [B, T, H] or [T, H]
+            alpha = alpha.detach().cpu().float()
             
-            # Ensure answer_idx is within bounds
-            if answer_idx.numel() > 0:
-                max_idx = answer_idx.max().item()
-                if max_idx < alpha.size(0):
-                    alpha_sel = alpha[answer_idx]
-                    # Move to CPU before converting to list to avoid CUDA sync errors inside list comp
-                    alpha_layer_hist.append(alpha_sel.detach().cpu().mean(dim=0).tolist())
-                else:
-                    # Fallback if indices mismatch
-                    alpha_layer_hist.append([0.0] * alpha.shape[-1])
+            # Squeeze all singleton dimensions
+            alpha = alpha.squeeze() 
+            
+            if alpha.dim() > 1:
+                # Average over all dimensions except the last one (Heads)
+                dims_to_reduce = list(range(alpha.dim() - 1))
+                alpha_mean = alpha.mean(dim=dims_to_reduce)
             else:
-                alpha_layer_hist.append([0.0] * alpha.shape[-1])
+                alpha_mean = alpha
+                
+            alpha_list = alpha_mean.tolist()
+            
+            # Ensure it's a list of floats
+            if isinstance(alpha_list, float):
+                alpha_list = [alpha_list]
+            
+            alpha_layer_hist.append(alpha_list)
         else:
             alpha_layer_hist.append([0.0] * model.base.config.num_attention_heads)
 
@@ -276,6 +278,8 @@ def compute_metrics(
 # Main training routine
 # ---------------------------------------------------------------------------
 
+
+import time
 
 def main() -> None:
     args = parse_args()
@@ -463,8 +467,14 @@ def main() -> None:
                 total_loss += loss.item()
                 
                 # Compute metrics for the LAST chunk only to avoid spamming
-                if chunk_idx == len(chunks) - 1:
+                # Optimization: Only compute metrics every 50 steps to avoid CPU/GPU sync overhead
+                # FIX: Always log first 100 steps for debugging/short runs
+                should_log = (global_step < 100) or (global_step % 50 == 0)
+                if chunk_idx == len(chunks) - 1 and should_log:
                      metrics = compute_metrics(outputs, c_labels, tokenizer, model)
+                     print(f"[Step {global_step}] Loss: {total_loss:.4f}", flush=True)
+                elif chunk_idx == len(chunks) - 1:
+                     metrics = None
 
             if micro_step % accum_steps == 0:
                 if scaler.is_enabled():
